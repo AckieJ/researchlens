@@ -3,40 +3,47 @@ import { api } from './api'
 import Setup from './components/Setup.jsx'
 import Progress from './components/Progress.jsx'
 import Workspace from './components/Workspace.jsx'
-import Demo from './components/Demo.jsx'
 
-const readHash = () => (location.hash.match(/^#\/ws\/([\w-]+)/) || [])[1] || null
+const fromHash = () => (window.location.hash.match(/^#\/ws\/([\w-]+)/) || [])[1] || null
+
 export default function App() {
-  const [id, setId] = useState(readHash())
-  const [demo, setDemo] = useState(location.hash === '#/preview')
+  const [id, setId] = useState(fromHash)
   const [status, setStatus] = useState(null)
   const [error, setError] = useState('')
+  const [retry, setRetry] = useState(0)
   useEffect(() => {
-    const on = () => { setStatus(null); setId(readHash()); setDemo(location.hash === '#/preview') }
-    addEventListener('hashchange', on)
-    return () => removeEventListener('hashchange', on)
+    function sync() { setId(fromHash()); setStatus(null); setError('') }
+    window.addEventListener('hashchange', sync)
+    return () => window.removeEventListener('hashchange', sync)
   }, [])
   useEffect(() => {
     if (!id) return
-    let stop = false, timer
+    let active = true
+    let timeout
+    let failures = 0
     const tick = async () => {
       try {
-        const s = await api.status(id)
-        if (stop) return
-        setStatus(s); setError('')
-        if (!['done', 'error'].includes(s.status)) timer = setTimeout(tick, 2500)
-      } catch (e) { if (!stop) { setError(e.message); timer = setTimeout(tick, 5000) } }
+        const response = await api.status(id)
+        if (!active) return
+        failures = 0
+        setStatus(response)
+        setError('')
+        if (!['done', 'error'].includes(response.status)) timeout = setTimeout(tick, 2500)
+      } catch (err) {
+        if (!active) return
+        failures += 1
+        setError(`Unable to refresh investigation (${failures} attempt${failures === 1 ? '' : 's'}): ${err.message}`)
+        timeout = setTimeout(tick, Math.min(15000, 3000 * failures))
+      }
     }
     tick()
-    return () => { stop = true; clearTimeout(timer) }
-  }, [id])
-  const open = wsId => { location.hash = `#/ws/${wsId}` }
-  const home = () => { location.hash = ''; setDemo(false); setId(null) }
-  if (demo) return <Demo onHome={home}/>
-  if (!id) return <Setup onCreated={open} onOpen={open} onDemo={() => { location.hash = '#/preview' }} />
-  if (error && !status) return <div className="page narrow"><p className="error">{error}</p><button onClick={home}>Back</button></div>
-  if (!status) return <div className="page narrow"><p className="muted">Loading workspace…</p></div>
-  if (status.status === 'error') return <div className="page narrow"><h2>Investigation stopped</h2><p className="error">{status.error}</p><button onClick={home}>Start over</button></div>
-  if (status.status !== 'done' && status.status !== 'evaluating') return <Progress status={status} onHome={home} />
-  return <Workspace id={id} status={status} onHome={home} />
+    return () => { active = false; clearTimeout(timeout) }
+  }, [id, retry])
+  const home = () => { window.location.hash = ''; setId(null); setStatus(null); setError('') }
+  const open = (wsId) => { window.location.hash = `#/ws/${wsId}` }
+  if (!id) return <Setup onCreated={open} onOpen={open} />
+  if (status?.status === 'error') return <div className="app-shell"><div className="live-error-screen"><span className="eyebrow">INVESTIGATION ERROR</span><h1>The analysis could not finish.</h1><p>{status.error || 'The backend reported an error.'}</p><div className="live-actions"><button className="primary" onClick={home}>Start another investigation ↗</button><button onClick={() => setRetry(r => r + 1)}>Check status again</button></div><p className="muted small">Workspace ID: {id}</p></div></div>
+  if (!status) return <div className="app-shell"><div className="live-loading"><div className="spinner"/><h2>Connecting to your investigation…</h2><p>{error || 'Requesting status from your research backend.'}</p><button onClick={() => setRetry(r => r+1)}>Try again</button><button className="link" onClick={home}>Return home</button></div></div>
+  if (status.status !== 'done' && status.status !== 'evaluating') return <Progress status={status} error={error} onRetry={()=>setRetry(r=>r+1)} onHome={home}/>
+  return <Workspace id={id} status={status} onHome={home}/>
 }

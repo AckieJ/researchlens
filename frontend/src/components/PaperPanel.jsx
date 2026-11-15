@@ -4,7 +4,7 @@ import { api, LABELS } from '../api'
 export default function PaperPanel({ id, onEdge }) {
   const [p, setP] = useState(null)
   const [error, setError] = useState('')
-  useEffect(() => { setP(null); api.paper(id).then(setP).catch((e) => setError(e.message)) }, [id])
+  useEffect(() => { setP(null); setError(''); api.paper(id).then(setP).catch((e) => setError(e.message)) }, [id])
   if (error) return <p className="error">{error}</p>
   if (!p) return <p className="muted">Loading…</p>
   const link = p.doi ? `https://doi.org/${p.doi}` : p.url

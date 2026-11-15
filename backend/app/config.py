@@ -38,3 +38,6 @@ FULL_TEXT_MIN = 3000   # fewer characters than this = treat as abstract-only
 ALLOWLIST_PATH = os.getenv("ALLOWLIST_PATH", os.path.join(os.path.dirname(__file__), "..", "config", "allowlist.yaml"))
 EXTRA_ALLOWED_DOMAINS = [d.strip() for d in os.getenv("EXTRA_ALLOWED_DOMAINS", "").split(",") if d.strip()]
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+
+# Do not list all user research questions publicly without authentication.
+PUBLIC_WORKSPACE_LIST = _b("PUBLIC_WORKSPACE_LIST", False)

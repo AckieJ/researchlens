@@ -43,9 +43,9 @@ function sheet() {
   return s
 }
 
-function apply(cy, { minRel, on }) {
+function apply(cy, { minRel, on, search = "" }) {
   cy.batch(() => {
-    cy.nodes('.paper').forEach((n) => n.style('display', n.data('rel') >= minRel ? 'element' : 'none'))
+    cy.nodes('.paper').forEach((n) => n.style('display', n.data('rel') >= minRel && (!search.trim() || String(n.data('title') || '').toLowerCase().includes(search.trim().toLowerCase())) ? 'element' : 'none'))
     cy.edges('.rel').forEach((e) => e.style('display', on[e.data('label')] ? 'element' : 'none'))
   })
 }
@@ -55,8 +55,9 @@ export default function GraphView({ graph, selected, onPaper, onEdge }) {
   const [minRel, setMinRel] = useState(0)
   const [on, setOn] = useState(Object.fromEntries(Object.keys(LABELS).map((k) => [k, true])))
   const [tip, setTip] = useState(null)
+  const [search, setSearch] = useState('')
   const cb = useRef({}); cb.current = { onPaper, onEdge }
-  const filt = useRef({}); filt.current = { minRel, on }
+  const filt = useRef({}); filt.current = { minRel, on, search }
 
   useEffect(() => {
     const cy = cytoscape({ container: box.current, elements: build(graph), style: sheet(), layout: { name: 'preset' }, minZoom: 0.3, maxZoom: 3, wheelSensitivity: 0.25 })
@@ -70,7 +71,7 @@ export default function GraphView({ graph, selected, onPaper, onEdge }) {
     return () => cy.destroy()
   }, [graph])
 
-  useEffect(() => { if (cyRef.current) apply(cyRef.current, { minRel, on }) }, [minRel, on])
+  useEffect(() => { if (cyRef.current) apply(cyRef.current, { minRel, on, search }) }, [minRel, on, search])
 
   useEffect(() => {
     const cy = cyRef.current
@@ -83,6 +84,7 @@ export default function GraphView({ graph, selected, onPaper, onEdge }) {
   return (
     <section className="graphbox">
       <div className="controls">
+        <label className="live-graph-search">⌕ <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Find a study by title…" aria-label="Find a study" /></label>
         <label>Minimum relevance <input type="range" min="0" max="0.9" step="0.05" value={minRel} onChange={(e) => setMinRel(+e.target.value)} /> <span className="muted small">{minRel.toFixed(2)}</span></label>
         <div className="toggles">
           {Object.entries(LABELS).map(([k, v]) => (
@@ -93,6 +95,11 @@ export default function GraphView({ graph, selected, onPaper, onEdge }) {
       </div>
       <div className="canvas" role="img" aria-label="Radial evidence graph. Papers closer to the center are more relevant to the question.">
         <div ref={box} className="cy" />
+        <div className="live-graph-actions">
+          <button title="Zoom in" aria-label="Zoom in" onClick={()=>{const cy=cyRef.current; if(cy)cy.zoom({level:Math.min(3,cy.zoom()*1.2),renderedPosition:{x:cy.width()/2,y:cy.height()/2}})}}>＋</button>
+          <button title="Zoom out" aria-label="Zoom out" onClick={()=>{const cy=cyRef.current; if(cy)cy.zoom({level:Math.max(.3,cy.zoom()/.82),renderedPosition:{x:cy.width()/2,y:cy.height()/2}})}}>−</button>
+          <button title="Fit graph" aria-label="Fit graph" onClick={()=>cyRef.current?.fit(undefined,40)}>⤢</button>
+        </div>
         {tip && <div className="tip" style={{ left: tip.x + 14, top: tip.y + 10 }}>{tip.t}</div>}
       </div>
       <p className="muted small legend">Closer to the center = more relevant to the question. Dashed outline = abstract only. Gold ring = newly added paper. Small nodes joined by dotted lines were found by following citations. Relevance helps you navigate; it is not a measure of truth.</p>

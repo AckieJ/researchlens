@@ -1,12 +1,18 @@
 const B = '/api'
 
 async function j(r) {
-  if (!r.ok) {
-    let m = r.statusText
-    try { m = (await r.json()).detail || m } catch { /* keep status text */ }
-    throw new Error(m)
+  const contentType = r.headers.get('content-type') || ''
+  if (!contentType.includes('application/json')) {
+    throw new Error(`Backend returned ${r.status} ${contentType || 'unknown content'} instead of JSON. Check the Vercel /api rewrite and Render deployment.`)
   }
-  return r.json()
+  let body
+  try { body = await r.json() }
+  catch { throw new Error(`Invalid JSON from backend (HTTP ${r.status}). Check Render logs.`) }
+  if (!r.ok) {
+    const detail = body?.detail || body?.message || r.statusText
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+  }
+  return body
 }
 
 const get = (p) => fetch(B + p).then(j)

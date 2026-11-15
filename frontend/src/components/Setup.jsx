@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import { api } from '../api'
 
 const EXAMPLES = [
@@ -7,14 +7,12 @@ const EXAMPLES = [
   { tag: 'NEUROSCIENCE', title: 'Does sleep after studying improve memory retention?', detail: 'Sleep · consolidation · memory' },
 ]
 
-export default function Setup({ onCreated, onOpen, onDemo }) {
+export default function Setup({ onCreated, onOpen }) {
   const [question, setQuestion] = useState('')
   const [files, setFiles] = useState([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [recent, setRecent] = useState([])
   const fileRef = useRef(null)
-  useEffect(() => { api.list().then(setRecent).catch(() => {}) }, [])
   const submit = async (e) => {
     e.preventDefault()
     setBusy(true); setError('')
@@ -24,7 +22,7 @@ export default function Setup({ onCreated, onOpen, onDemo }) {
     <header className="site-header wrap">
       <a href="#" className="logo-lockup" aria-label="ResearchLens home"><span className="logo-mark">✳</span><span>research<span className="logo-accent">lens</span></span><span className="logo-beta">BETA</span></a>
       <nav className="site-nav"><a href="#how-it-works">How it works</a><a href="#examples">Explore topics</a><a href="#about">About</a></nav>
-      <button className="nav-cta" onClick={onDemo}>Explore live preview <span>↗</span></button>
+      <a className="nav-cta" href="#how-it-works">How it works <span>↗</span></a>
     </header>
 
     <main>
@@ -43,7 +41,7 @@ export default function Setup({ onCreated, onOpen, onDemo }) {
               <input ref={fileRef} className="sr-only" type="file" accept="application/pdf" multiple onChange={e => setFiles([...e.target.files])}/>
               <button className="primary search-submit" disabled={busy || question.trim().length < 8}>{busy ? 'Starting…' : 'Investigate'} <span>↗</span></button>
             </div>
-            {error && <div className="inline-error" role="alert">{error}. You can also explore the interactive preview without a backend.</div>}
+            {error && <div className="inline-error" role="alert">{error}. Check the API connection and try again.</div>}
           </form>
           <p className="privacy-hint">✦ Sources are linked to original studies. Your uploaded PDFs are limited to your workspace.</p>
         </div>
@@ -73,9 +71,8 @@ export default function Setup({ onCreated, onOpen, onDemo }) {
 
       <section id="examples" className="examples-section wrap"><div className="section-heading compact"><div><div className="eyebrow muted-eyebrow">START SOMEWHERE INTERESTING</div><h2>Curiosity is a good starting point.</h2></div></div><div className="examples-grid">{EXAMPLES.map(x=><button key={x.title} className="example-card" onClick={()=>{setQuestion(x.title);scrollTo({top:0,behavior:'smooth'});document.getElementById('q')?.focus()}}><span className="example-tag">{x.tag}</span><strong>{x.title}</strong><span className="example-footer">{x.detail} <b>↗</b></span></button>)}</div></section>
 
-      {recent.length > 0 && <section className="recent-section wrap"><h2>Your recent investigations</h2><div className="recent-list">{recent.slice(0,5).map(r=><button key={r.id} onClick={()=>onOpen(r.id)}><span>{r.question}</span><small>{r.status}</small><b>↗</b></button>)}</div></section>}
-      <section id="about" className="closing-cta wrap"><div><div className="eyebrow">EXPERIENCE THE PRODUCT</div><h2>See what the evidence is really saying.</h2><p>Explore a fully interactive example—no API keys or backend required.</p></div><button onClick={onDemo}>Open interactive preview ↗</button></section>
+      <section id="about" className="closing-cta wrap"><div><div className="eyebrow">REAL RESEARCH, TRACEABLE SOURCES</div><h2>Investigate what the evidence is really saying.</h2><p>Search scholarly literature, inspect exact source quotations, and compare studies without fictional demo results.</p></div><a href="#q" className="nav-cta">Start an investigation ↗</a></section>
     </main>
-    <footer className="site-footer wrap"><span className="logo-lockup footer-logo"><span className="logo-mark">✳</span> research<span className="logo-accent">lens</span></span><span>Built for curious minds. Evidence first, always.</span><span>ResearchLens · Prototype</span></footer>
+    <footer className="site-footer wrap"><span className="logo-lockup footer-logo"><span className="logo-mark">✳</span> research<span className="logo-accent">lens</span></span><span>Built for curious minds. Evidence first, always.</span><span>ResearchLens · Live analysis</span></footer>
   </div>
 }

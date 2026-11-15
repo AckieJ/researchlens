@@ -4,9 +4,11 @@ A claim-level evidence graph for one research question. It gathers papers, extra
 
 Stack: React + Cytoscape (frontend) · FastAPI + RQ workers (backend) · Tiger Data (Postgres + pgvector) · Gemini · Bright Data · OpenAlex · deploy on Render/Vercel or Vultr.
 
-**November 2026 update:** OpenAlex uses `OPENALEX_API_KEY` (`Authorization: Bearer`). See [OPENALEX_AND_DEPLOYMENT.md](OPENALEX_AND_DEPLOYMENT.md) for the exact setup and the updated professional UI / GitHub Pages preview.
+**November 2026 update:** OpenAlex uses `OPENALEX_API_KEY` (`Authorization: Bearer`). See [DEPLOY_RENDER_VERCEL.md](DEPLOY_RENDER_VERCEL.md) for the live-only UI, queue requirements, and Render + Vercel setup.
 
-> **Status:** the backend logic that needs no external services is unit-tested (`backend/tests`). The full pipeline, the Google Scholar HTML parser against a real page, and the frontend build were **not run against live services** when this repo was generated. Follow "First run checklist" below and expect to adjust small details.
+> **This version has no fictional demo data or demo route.** The live dashboard displays only real backend results; a missing worker or failed API displays a clear error.
+
+> **Status:** the backend logic that needs no external services is unit-tested (`backend/tests`). The full pipeline and Google Scholar parser have **not** been tested with your live provider credentials. The frontend dependency installation could not complete in the build environment; check the Vercel build logs. Follow "First run checklist" below and expect to adjust small details.
 
 ## How it works
 

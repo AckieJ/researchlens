@@ -8,7 +8,7 @@ const CHECK = { same_population: 'Population', same_duration: 'Duration', same_m
 export default function Compare({ id, onPaper }) {
   const [e, setE] = useState(null)
   const [error, setError] = useState('')
-  useEffect(() => { setE(null); api.edge(id).then(setE).catch((x) => setError(x.message)) }, [id])
+  useEffect(() => { setE(null); setError(''); api.edge(id).then(setE).catch((x) => setError(x.message)) }, [id])
   if (error) return <p className="error">{error}</p>
   if (!e) return <p className="muted">Loading…</p>
   const L = LABELS[e.label] || { name: e.label, color: 'var(--muted)' }
