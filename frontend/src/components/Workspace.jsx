@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, LABELS } from '../api'
 import GraphView from './GraphView.jsx'
 import PaperPanel from './PaperPanel.jsx'
@@ -17,6 +17,7 @@ const NAV = [
 const count = obj => Object.values(obj || {}).reduce((a,b)=>a+Number(b||0),0)
 
 export default function Workspace({ id, status, onHome }) {
+  const inspectorScroll = useRef(null)
   const [tab, setTab] = useState('graph')
   const [graph, setGraph] = useState(null)
   const [selection, setSelection] = useState(null)
@@ -42,6 +43,7 @@ export default function Workspace({ id, status, onHome }) {
     const priority = ['genuine_contradiction','apparent_contradiction','unresolved','supports_compatible','related_not_comparable']
     return priority.indexOf(a.label) - priority.indexOf(b.label)
   }),[graph])
+  useEffect(() => { if (inspectorScroll.current) inspectorScroll.current.scrollTop = 0 }, [selection?.id, selection?.type])
   const chooseEdge = (edgeId) => {setSelection({type:'edge',id:edgeId});setCompareId(edgeId)}
   const choosePaper = paperId => setSelection({type:'paper',id:paperId})
 
@@ -71,11 +73,11 @@ export default function Workspace({ id, status, onHome }) {
         {tab==='graph'&&<div className="dashboard-content">
           <section className="graph-workspace" aria-label="Evidence network">
             <div className="panel-heading"><div><h2>Evidence network</h2><p>Select a paper or connection to inspect real source evidence.</p></div><button className="help-trigger" onClick={()=>setHelp(v=>!v)} aria-expanded={help}>ⓘ How to read this</button></div>
-            {help&&<div className="help-note">Distance from the center indicates relevance to your research question, not scientific truth. Solid red edges indicate model-flagged genuine contradictions; dashed red indicate apparent contradictions. Inspect both source quotations before drawing conclusions.</div>}
+            {help&&<div className="help-note">Use the mouse wheel or +/− controls to zoom as you would on a map. Paper titles appear as you zoom closer; drag the canvas to move around. Click a colored line to inspect its evidence. Distance from the center indicates relevance, not scientific truth. Inspect source quotations before drawing conclusions.</div>}
             {graph ? (papers.length ? <GraphView graph={graph} selected={selection} onPaper={choosePaper} onEdge={chooseEdge}/> : <div className="live-empty"><div className="empty-symbol">◇</div><h3>No papers in this evidence graph</h3><p>The investigation completed without retained papers. Try a narrower question, check retrieval access, or add a PDF.</p><button className="primary" onClick={()=>setTab('add')}>Upload a paper ↗</button></div>) : <div className="live-empty"><div className="spinner"/><h3>Loading your evidence network…</h3></div>}
           </section>
           <aside className="inspector-panel"><div className="panel-heading"><div><h2>Evidence inspector</h2><p>{selection ? selection.type === 'paper' ? 'Selected scientific paper' : 'Selected relationship' : 'Select a paper or connection'}</p></div><span className="inspector-symbol">✧</span></div>
-            <div className="inspector-body">
+            <div className="inspector-body" ref={inspectorScroll} tabIndex={0} aria-label="Scrollable paper and comparison details">
               {!selection&&<div className="inspector-empty"><div className="empty-symbol">◎</div><h3>Explore the evidence</h3><p>Click a paper to read its extracted claims and source quotations. Click a relationship to compare the study methods and findings.</p><p className="inspector-notice">Every item in this workspace comes from your live backend, not example data.</p></div>}
               {selection?.type==='paper'&&<PaperPanel id={selection.id} onEdge={chooseEdge}/>}
               {selection?.type==='edge'&&<><Compare id={selection.id} onPaper={choosePaper}/><button className="primary full-button" onClick={()=>setTab('compare')}>Open full comparison ↗</button></>}
