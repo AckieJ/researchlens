@@ -65,6 +65,10 @@ MATCH_THRESHOLD = _f("MATCH_THRESHOLD", 0.80)
 STRONG_MATCH = _f("STRONG_MATCH", 0.88)   # similarity that overrides an outcome-family mismatch
 MAX_PAIRS = _i("MAX_PAIRS", 300)
 WORKERS = _i("LLM_CONCURRENCY", 4)
+IO_WORKERS = _i("IO_CONCURRENCY", 6)          # parallel full-text / API fetches (not LLM calls)
+# Reuse work done in earlier workspaces: paper embeddings, extracted claims, and verdicts for identical quote pairs.
+# Set REUSE_CACHE=false after changing GEMINI_EMBED_MODEL, the extraction prompt, or the verification rules.
+REUSE_CACHE = _b("REUSE_CACHE", True)
 MAX_TEXT_CHARS = _i("MAX_TEXT_CHARS", 100000)
 FULL_TEXT_MIN = 3000   # fewer characters than this = treat as abstract-only
 

@@ -42,8 +42,8 @@ def _warn(ws, msg):
        "COALESCE(progress->'warnings','[]'::jsonb) || to_jsonb(%s::text)) WHERE id=%s", (msg, ws))
 
 
-def pmap(fn, items):
-    with ThreadPoolExecutor(C.WORKERS) as pool:
+def pmap(fn, items, workers=None):
+    with ThreadPoolExecutor(workers or C.WORKERS) as pool:
         return list(pool.map(fn, items))
 
 
@@ -124,13 +124,19 @@ def discover(ws, parsed):
     question = one("SELECT question FROM workspaces WHERE id=%s", (ws,))["question"]
     existing = q("SELECT id,doi,title,year FROM papers WHERE workspace_id=%s", (ws,))
     cands, warnings, scholar = [], [], ScholarClient()
-    for qs in parsed["search_queries"] + [question]:
+    queries = parsed["search_queries"] + [question]
+
+    def oa_search(qs):
         try:
-            for w in oa.search_works(qs, 25):
-                w.update({"lane": "A", "query": qs})
-                cands.append(w)
+            return [dict(w, lane="A", query=qs) for w in oa.search_works(qs, 25)], None
         except Exception as e:
-            warnings.append(f"OpenAlex failed for '{qs[:40]}': {e}")
+            return [], f"OpenAlex failed for '{qs[:40]}': {e}"
+
+    for found, warn in pmap(oa_search, queries, C.IO_WORKERS):      # API lane: all queries at once
+        cands.extend(found)
+        if warn:
+            warnings.append(warn)
+    for qs in queries:                                              # Scholar lane: sequential, rate limited
         if scholar.enabled() and not scholar.blocked:
             try:
                 for it in scholar.search(qs, 20):
@@ -151,7 +157,19 @@ def discover(ws, parsed):
     progress(ws, duplicates_removed=dups, candidates=min(len(new), C.MAX_CANDIDATES) + len(existing), warnings=warnings)
 
 
+def reuse_paper_embeddings(ws):
+    """Copy embeddings of papers (same DOI, else same title) already embedded in other workspaces."""
+    if not C.REUSE_CACHE:
+        return
+    ex("UPDATE papers p SET embedding = o.embedding FROM ("
+       " SELECT DISTINCT ON (k) k, embedding FROM ("
+       "  SELECT coalesce(doi, lower(title)) AS k, embedding FROM papers WHERE workspace_id <> %s::uuid AND embedding IS NOT NULL) x"
+       " ORDER BY k) o"
+       " WHERE p.workspace_id=%s::uuid AND p.embedding IS NULL AND o.k = coalesce(p.doi, lower(p.title))", (ws, ws))
+
+
 def embed_papers(ws):
+    reuse_paper_embeddings(ws)
     rows = q("SELECT id,title,abstract FROM papers WHERE workspace_id=%s AND embedding IS NULL", (ws,))
     for r, e in zip(rows, gemini.embed([f"{r['title']}. {(r['abstract'] or '')[:C.EMBED_PAPER_CHARS]}" for r in rows])):
         ex("UPDATE papers SET embedding=%s::vector WHERE id=%s", (vec(e), r["id"]))
@@ -232,7 +250,7 @@ def retrieve_all(ws):
             text, level = (p.get("full_text") or p.get("abstract") or ""), "abstract"
         ex("UPDATE papers SET full_text=%s, text_level=%s WHERE id=%s", (text, level, p["id"]))
 
-    pmap(work, rows)
+    pmap(work, rows, C.IO_WORKERS)
     ex("UPDATE papers SET kept=false WHERE workspace_id=%s AND kept AND coalesce(length(full_text),0) < 200", (ws,))
     # Scholar-only results that never resolved to a DOI stay out of verdicts unless full text was retrieved.
     ex("UPDATE papers SET kept=false WHERE workspace_id=%s AND kept AND confidence='low' AND text_level<>'full'", (ws,))
@@ -251,10 +269,35 @@ def _int(v):
         return None
 
 
+CLAIM_FIELDS = ("claim_text,intervention,outcome,outcome_family,direction,significance,effect_size,population,"
+                "sample_n,design,duration,measure,limitations,quote,location")
+
+
+def reuse_claims(p):
+    """Copy claims (and their embeddings) already extracted from the same paper with the same text in another workspace.
+    Quotes stay valid because the source text is identical (same text level, near-identical length)."""
+    if not C.REUSE_CACHE:
+        return 0
+    src = one("SELECT p2.id FROM papers p2 WHERE p2.workspace_id <> %s::uuid AND p2.text_level = %s "
+              "AND coalesce(p2.doi, lower(p2.title)) = coalesce(%s, lower(%s)) "
+              "AND abs(coalesce(length(p2.full_text),0) - %s) < 50 "
+              "AND EXISTS (SELECT 1 FROM claims c WHERE c.paper_id = p2.id) ORDER BY p2.created_at DESC LIMIT 1",
+              (p["workspace_id"], p.get("text_level") or "abstract", p.get("doi"), p.get("title") or "",
+               len(p.get("full_text") or "")))
+    if not src:
+        return 0
+    ex(f"INSERT INTO claims (workspace_id,paper_id,{CLAIM_FIELDS},embedding) "
+       f"SELECT %s::uuid,%s::uuid,{CLAIM_FIELDS},embedding FROM claims WHERE paper_id=%s::uuid", (p["workspace_id"], p["id"], src["id"]))
+    return one("SELECT count(*) AS n FROM claims WHERE paper_id=%s", (p["id"],))["n"]
+
+
 def extract_paper(p):
     text = (p.get("full_text") or p.get("abstract") or "")[:C.MAX_TEXT_CHARS]
     if len(text) < 200:
         return 0, 0
+    reused = reuse_claims(p)
+    if reused:
+        return reused, 0
     nt, level = normalize(text), p.get("text_level") or "abstract"
     prompt, valid, rejected, seen = prompts.extract(p, text, level), [], 0, set()
     for attempt in range(2):
@@ -323,7 +366,7 @@ WHERE pa.workspace_id=%(ws)s AND pb.workspace_id=%(ws)s AND pa.kept AND pb.kept
   AND (%(only)s::uuid[] IS NULL OR a.paper_id = ANY(%(only)s::uuid[]) OR b.paper_id = ANY(%(only)s::uuid[]))
   AND 1-(a.embedding <=> b.embedding) >= %(th)s
   AND (lower(coalesce(a.outcome_family,'')) = lower(coalesce(b.outcome_family,'')) OR 1-(a.embedding <=> b.embedding) >= %(strong)s)
-  AND NOT EXISTS (SELECT 1 FROM claim_edges e WHERE e.claim_a=a.id AND e.claim_b=b.id)
+  AND NOT EXISTS (SELECT 1 FROM claim_edges e WHERE (e.claim_a=a.id AND e.claim_b=b.id) OR (e.claim_a=b.id AND e.claim_b=a.id))
 ORDER BY sim DESC LIMIT %(lim)s
 """
 
@@ -334,8 +377,30 @@ def match(ws, only=None):
 
 
 # ---------- Stage 7: verify relationships ----------
+def reuse_verdict(a, b):
+    """A verdict for the same two quotes (same orientation) from another workspace, if any."""
+    if not C.REUSE_CACHE:
+        return None
+    return one("SELECT e.label, e.factors, e.confidence, e.reason FROM claim_edges e "
+               "JOIN claims ca ON ca.id=e.claim_a JOIN claims cb ON cb.id=e.claim_b "
+               "WHERE e.workspace_id <> %s::uuid AND ca.quote = %s AND cb.quote = %s AND e.label IS NOT NULL LIMIT 1",
+               (a["workspace_id"], a["quote"], b["quote"]))
+
+
 def verify_one(ws, a, b, pair):
+    if (a["quote"] or "") > (b["quote"] or ""):       # canonical A/B order by quote text, so verdicts can be reused
+        a, b = b, a
     comp = comparability(a, b)
+    hit = reuse_verdict(a, b)
+    if hit:
+        conf = float(hit["confidence"] or 0.5)
+        if "abstract" in (a["text_level"], b["text_level"]):
+            conf = min(conf, 0.6)
+        row = one("INSERT INTO claim_edges (workspace_id,claim_a,claim_b,label,factors,confidence,reason,quotes,sim,comparability) "
+                  "VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s::jsonb) ON CONFLICT DO NOTHING RETURNING id",
+                  (ws, a["id"], b["id"], hit["label"], hit["factors"] or [], conf, hit["reason"],
+                   json.dumps({"a": a["quote"], "b": b["quote"]}), float(pair["sim"]), json.dumps(comp)))
+        return row["id"] if row else None
     pa, pb = passage(a["full_text"] or "", a["quote"]), passage(b["full_text"] or "", b["quote"])
     d = gemini.generate_json(prompts.verify(a, b, comp, pa, pb), system=prompts.VERIFY_SYSTEM, model=C.GEMINI_VERIFY_MODEL)
     label = d.get("label") if d.get("label") in prompts.LABELS else "unresolved"
