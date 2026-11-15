@@ -100,7 +100,13 @@ def comparability(a, b):
 def pdf_to_text(data):
     import fitz  # PyMuPDF
     doc = fitz.open(stream=data, filetype="pdf")
-    return "\n".join(f"[[page {i + 1}]]\n{p.get_text()}" for i, p in enumerate(doc))
+    text = "\n".join(f"[[page {i + 1}]]\n{p.get_text()}" for i, p in enumerate(doc))
+    return clean_text(text)
+
+
+def clean_text(t):
+    """Postgres text columns reject NUL (0x00) bytes, which PDF extraction often produces; also drop other control chars."""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", t or "")
 
 
 def html_to_text(html):

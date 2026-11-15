@@ -19,6 +19,8 @@ export default function Setup({ onCreated, onOpen }) {
   const fileRef = useRef(null)
   const submit = async (e) => {
     e.preventDefault()
+    const empty = files.find(f => f.size === 0)
+    if (empty) { setError(`${empty.name} is empty (0 bytes). Re-select it from a local folder`); return }
     setBusy(true); setError('')
     try { onCreated((await api.create(question, files, fresh, !skip)).id) } catch (err) { setError(err.message); setBusy(false) }
   }

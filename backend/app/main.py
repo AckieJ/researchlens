@@ -87,6 +87,11 @@ async def _read_pdf(f: UploadFile):
     if not (f.filename or "").lower().endswith(".pdf"):
         raise HTTPException(400, f"{f.filename}: only PDF files are supported")
     data = await f.read()
+    if not data:
+        raise HTTPException(400, f"{f.filename}: the file arrived empty (0 bytes). Re-select it from a local folder "
+                                 "(not an online-only cloud placeholder) and try again.")
+    if not data.lstrip()[:5] == b"%PDF-":
+        raise HTTPException(400, f"{f.filename}: this does not look like a PDF file.")
     if len(data) > MAX_UPLOAD:
         raise HTTPException(413, f"{f.filename}: file is larger than 25 MB")
     return data
@@ -242,7 +247,13 @@ async def create_workspace(question: str = Form(...), fresh: bool = Form(False),
     ws = one("INSERT INTO workspaces (question, question_key, progress) VALUES (%s,%s,%s::jsonb) RETURNING id",
              (question, question_key(question), json.dumps({"fresh": bool(fresh), "web_search": bool(web_search)})))["id"]
     for name, data in blobs:
-        stages.ingest_upload(ws, name, data)
+        try:
+            stages.ingest_upload(ws, name, data)
+        except Exception as exc:
+            logging.exception("Could not read uploaded PDF %s", name)
+            q("DELETE FROM workspaces WHERE id=%s", (ws,))
+            raise HTTPException(400, f"{name}: could not be processed ({type(exc).__name__}: {str(exc)[:200]}). "
+                                     "Try a text-based, non-encrypted PDF.") from exc
     try:
         enqueue("run_workspace_job", ws)
     except Exception as exc:
