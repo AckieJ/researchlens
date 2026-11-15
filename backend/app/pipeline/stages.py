@@ -36,6 +36,12 @@ def progress(ws, **kv):
     ex("UPDATE workspaces SET progress = COALESCE(progress,'{}'::jsonb) || %s::jsonb WHERE id=%s", (json.dumps(kv), ws))
 
 
+def _warn(ws, msg):
+    """Append a warning shown on the progress screen."""
+    ex("UPDATE workspaces SET progress = jsonb_set(COALESCE(progress,'{}'::jsonb), '{warnings}', "
+       "COALESCE(progress->'warnings','[]'::jsonb) || to_jsonb(%s::text)) WHERE id=%s", (msg, ws))
+
+
 def pmap(fn, items):
     with ThreadPoolExecutor(C.WORKERS) as pool:
         return list(pool.map(fn, items))
@@ -82,11 +88,14 @@ def ingest_upload(ws, filename, content, is_new=False):
 # ---------- Stage 1 ----------
 def understand(ws):
     w = one("SELECT question FROM workspaces WHERE id=%s", (ws,))
-    parsed = gemini.generate_json(prompts.understand(w["question"]))
+    try:
+        parsed = gemini.generate_json(prompts.understand(w["question"]))
+        emb = gemini.embed([w["question"]])[0]
+    except Exception as e:
+        raise RuntimeError("Gemini call failed while interpreting the question. " + gemini.explain(e)) from e
     parsed["search_queries"] = [s for s in parsed.get("search_queries") or [] if s][:5] or [w["question"]]
     parsed["sub_questions"] = [s for s in parsed.get("sub_questions") or [] if s][:6] or [w["question"]]
     parsed["outcome_families"] = [s for s in parsed.get("outcome_families") or [] if s][:5]
-    emb = gemini.embed([w["question"]])[0]
     ex("UPDATE workspaces SET parsed=%s::jsonb, embedding=%s::vector WHERE id=%s", (json.dumps(parsed), vec(emb), ws))
     return parsed
 
@@ -133,6 +142,8 @@ def discover(ws, parsed):
     if not scholar.enabled():
         warnings.append("Google Scholar lane skipped: BRIGHT_DATA_API_KEY or Web Unlocker zone not set.")
     new, dups, extra = dedupe([c for c in cands if c.get("title")], existing)
+    if not new and not existing:
+        raise RuntimeError("No papers were found. " + (" | ".join(warnings[:3]) or "The search APIs returned nothing for this question; try rephrasing it."))
     for c in new[:C.MAX_CANDIDATES]:
         insert_paper(ws, c)
     for pid, lane, query in extra:
@@ -283,15 +294,22 @@ def extract_all(ws):
     papers = q("SELECT * FROM papers WHERE workspace_id=%s AND kept AND NOT EXISTS "
                "(SELECT 1 FROM claims c WHERE c.paper_id=papers.id)", (ws,))
 
+    errors = []
+
     def work(p):
         try:
             return extract_paper(p)
-        except Exception:
+        except Exception as e:
             log.error("extraction failed for %s\n%s", p["title"], traceback.format_exc())
+            errors.append(gemini.explain(e))
             return 0, 0
 
     res = pmap(work, papers)
     progress(ws, claims_extracted=sum(r[0] for r in res), claims_rejected=sum(r[1] for r in res))
+    if papers and len(errors) == len(papers):
+        raise RuntimeError(f"Claim extraction failed for all {len(papers)} papers. First error: {errors[0]}")
+    if errors:
+        _warn(ws, f"Claim extraction failed for {len(errors)} of {len(papers)} papers. First error: {errors[0]}")
     embed_claims(ws)
 
 
@@ -355,6 +373,8 @@ def verify_pairs(ws, pairs):
 
     out = pmap(work, pairs)
     progress(ws, pairs_verified=len([o for o in out if o]))
+    if pairs and not any(out):
+        _warn(ws, f"All {len(pairs)} claim-pair verifications failed; see Render logs for the Gemini error.")
     return [o for o in out if o]
 
 
@@ -501,4 +521,7 @@ def run_workspace(ws):
         set_status(ws, "done")
     except Exception as e:
         log.error("workspace %s failed\n%s", ws, traceback.format_exc())
-        set_status(ws, "error", str(e))
+        try:
+            set_status(ws, "error", str(e)[:1500])
+        except Exception:
+            log.exception("could not record error status")

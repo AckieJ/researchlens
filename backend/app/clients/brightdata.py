@@ -44,8 +44,18 @@ class ScholarBlocked(Exception):
     pass
 
 
+class BrightDataError(Exception):
+    """Bright Data refused the request for a configuration reason (bad key / zone). Not retried."""
+
+
+_fatal = {"msg": None}   # set once a credential/zone problem is detected; later calls fail instantly
+
+
 def _unlock(url, zone):
-    """POST to the Web Unlocker API and return the response (retried with backoff)."""
+    """POST to the Web Unlocker API and return the response. Config errors (400/401/403) fail fast with a clear message."""
+    if _fatal["msg"]:
+        raise BrightDataError(_fatal["msg"])
+
     def call():
         r = requests.post(
             "https://api.brightdata.com/request",
@@ -53,6 +63,12 @@ def _unlock(url, zone):
             json={"zone": zone, "url": url, "format": "raw"},
             timeout=90,
         )
+        if r.status_code in (400, 401, 403):
+            detail = r.headers.get("x-brd-err-msg") or r.headers.get("x-luminati-error") or r.text[:200]
+            _fatal["msg"] = (f"Bright Data rejected the request (HTTP {r.status_code}: {detail.strip()}). "
+                             f"Check BRIGHT_DATA_API_KEY and that BRIGHT_DATA_UNLOCKER_ZONE ('{zone}') is the exact NAME "
+                             "of an active Web Unlocker zone.")
+            raise BrightDataError(_fatal["msg"])
         r.raise_for_status()
         return r
     return retry(call)
@@ -70,7 +86,7 @@ def _cache_put(key, url, body):
 
 class UnlockerClient:
     def enabled(self):
-        return bool(C.BRIGHT_DATA_API_KEY and C.BRIGHT_DATA_UNLOCKER_ZONE)
+        return bool(C.BRIGHT_DATA_API_KEY and C.BRIGHT_DATA_UNLOCKER_ZONE and not _fatal["msg"])
 
     def fetch_text(self, url):
         """Return extracted text of an allowlisted public page or PDF (cached for 7 days)."""
@@ -97,7 +113,7 @@ class ScholarClient:
         self.blocked = False
 
     def enabled(self):
-        return bool(C.BRIGHT_DATA_API_KEY and (C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE))
+        return bool(C.BRIGHT_DATA_API_KEY and (C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE) and not _fatal["msg"])
 
     def _page(self, url):
         if urlparse(url).hostname != SCHOLAR_HOST:
@@ -128,3 +144,11 @@ class ScholarClient:
         url = urljoin(BASE, url)
         url += ("&" if "?" in url else "?") + f"num={min(max(limit, 1), 20)}"
         return parse_scholar_html(self._page(url))[:limit]
+
+
+def fatal_message():
+    return _fatal["msg"]
+
+
+def reset_fatal():
+    _fatal["msg"] = None

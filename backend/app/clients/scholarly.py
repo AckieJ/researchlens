@@ -22,6 +22,10 @@ def _get(url, params=None, timeout=40):
 
     def call():
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if r.status_code in (401, 403) and "Authorization" in headers:
+            # A bad/expired key should not take the whole lane down: fall back to the keyless (rate-limited) API.
+            headers.pop("Authorization")
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 404:
             return None
         r.raise_for_status()

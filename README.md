@@ -4,6 +4,8 @@ A claim-level evidence graph for one research question. It gathers papers, extra
 
 Stack: React + Cytoscape (frontend) · FastAPI + RQ workers (backend) · Tiger Data (Postgres + pgvector) · Gemini · Bright Data · OpenAlex · deploy on Render/Vercel or Vultr.
 
+**Deploying free (Render + Vercel + Tiger Data)?** Follow [DEPLOY_RENDER_VERCEL.md](DEPLOY_RENDER_VERCEL.md) and check `/diagnostics` on your backend.
+
 **November 2026 update:** OpenAlex uses `OPENALEX_API_KEY` (`Authorization: Bearer`). See [DEPLOY_RENDER_VERCEL.md](DEPLOY_RENDER_VERCEL.md) for the live-only UI, queue requirements, and Render + Vercel setup.
 
 > **This version has no fictional demo data or demo route.** The live dashboard displays only real backend results; a missing worker or failed API displays a clear error.

@@ -1,9 +1,18 @@
-const B = '/api'
+// Default: same-origin '/api' (Vercel rewrite -> Render). Set VITE_API_URL=https://<your-service>.onrender.com in Vercel
+// to call Render directly instead; this avoids Vercel's rewrite timeout/body limits (needed for PDF uploads and cold starts).
+const RAW = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '')
+export const B = RAW || '/api'
+
+// Render's free tier sleeps; poke it as soon as the page loads so it is awake by the time the user submits.
+export const wake = () => fetch(B + '/health', { cache: 'no-store' }).then((r) => r.ok).catch(() => false)
 
 async function j(r) {
   const contentType = r.headers.get('content-type') || ''
   if (!contentType.includes('application/json')) {
-    throw new Error(`Backend returned ${r.status} ${contentType || 'unknown content'} instead of JSON. Check the Vercel /api rewrite and Render deployment.`)
+    const waking = [502, 503, 504].includes(r.status)
+    throw new Error(waking
+      ? `The backend is not responding yet (HTTP ${r.status}). Free Render servers take up to a minute to wake up; try again shortly.`
+      : `Backend returned ${r.status} ${contentType || 'unknown content'} instead of JSON. Check the Vercel /api rewrite (or VITE_API_URL) and the Render deployment.`)
   }
   let body
   try { body = await r.json() }
@@ -15,7 +24,13 @@ async function j(r) {
   return body
 }
 
-const get = (p) => fetch(B + p).then(j)
+const get = async (p) => {
+  // one quick retry smooths over a just-woken server
+  try { return await fetch(B + p).then(j) } catch (e) {
+    await new Promise((r) => setTimeout(r, 1500))
+    return fetch(B + p).then(j)
+  }
+}
 
 export const api = {
   create: (question, files) => {
@@ -24,6 +39,8 @@ export const api = {
     ;[...files].forEach((x) => f.append('files', x))
     return fetch(B + '/workspaces', { method: 'POST', body: f }).then(j)
   },
+  diagnostics: (refresh) => get('/diagnostics' + (refresh ? '?refresh=true' : '')),
+  retry: (id) => fetch(`${B}/workspaces/${id}/retry`, { method: 'POST' }).then(j),
   list: () => get('/workspaces'),
   status: (id) => get(`/workspaces/${id}/status`),
   graph: (id) => get(`/workspaces/${id}/graph`),

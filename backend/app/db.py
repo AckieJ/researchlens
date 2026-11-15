@@ -10,8 +10,15 @@ _pool = None
 def pool():
     global _pool
     if _pool is None:
-        _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=12, open=True,
-                               kwargs={"row_factory": dict_row, "autocommit": True})
+        # check_connection: free hosts/DBs drop idle connections; test each one before handing it out.
+        # open=False + explicit open avoids crashing at import time when the DB is briefly unreachable.
+        _pool = ConnectionPool(
+            DATABASE_URL, min_size=1, max_size=12, open=False, check=ConnectionPool.check_connection,
+            max_idle=120, max_lifetime=1800, timeout=30,
+            kwargs={"row_factory": dict_row, "autocommit": True, "connect_timeout": 15,
+                    "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3},
+        )
+        _pool.open(wait=False)
     return _pool
 
 

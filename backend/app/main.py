@@ -1,8 +1,12 @@
 import logging
+import threading
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from . import config as C
 from .db import one, q
@@ -13,8 +17,57 @@ from .pipeline import stages
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
-app = FastAPI(title="ResearchLens API")
-app.add_middleware(CORSMiddleware, allow_origins=C.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+log = logging.getLogger("researchlens")
+RUNNING_STATES = ("queued", "understanding", "discovering", "retrieving", "extracting", "matching", "verifying", "flagging", "layout", "evaluating")
+
+
+def _startup_tasks():
+    """Runs in the background so a slow/unreachable database never blocks the web server from binding its port."""
+    for p in C.config_problems():
+        log.warning("CONFIG: %s", p)
+    try:
+        from .init_db import apply
+        log.info("Schema applied from %s", apply())
+    except Exception:
+        log.exception("Schema init failed (see /diagnostics)")
+    if C.RUN_INLINE:
+        # Inline jobs live in this process's threads. If the process restarted (Render free tier sleeps/redeploys), they are gone.
+        try:
+            n = q("UPDATE workspaces SET status='error', error=%s WHERE status = ANY(%s) RETURNING id",
+                  ("The server restarted while this investigation was running (free hosting sleeps or redeploys). Press Retry to resume.",
+                   list(RUNNING_STATES)))
+            if n:
+                log.warning("Marked %d interrupted workspace(s) as error", len(n))
+        except Exception:
+            log.exception("Startup sweep failed")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    threading.Thread(target=_startup_tasks, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="ResearchLens API", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def json_errors(request, call_next):
+    """Return JSON (not an HTML/plain 500) on unexpected errors, so the UI can show the real reason.
+    Registered before CORSMiddleware so CORS headers are still added to these responses."""
+    try:
+        return await call_next(request)
+    except Exception as e:  # noqa: BLE001
+        log.exception("Unhandled error on %s %s", request.method, request.url.path)
+        name = type(e).__name__
+        if "Operational" in name or "PoolTimeout" in name or "Pool" in name:
+            msg = "The database is unreachable. Check DATABASE_URL (no surrounding quotes) and that the Tiger Data service is running."
+        else:
+            msg = f"{name}: {str(e)[:300]}"
+        return JSONResponse({"detail": msg}, status_code=503 if "database" in msg else 500)
+
+app.add_middleware(CORSMiddleware, allow_origins=C.CORS_ORIGINS, allow_origin_regex=C.CORS_ORIGIN_REGEX or None,
+                   allow_methods=["*"], allow_headers=["*"])
 MAX_UPLOAD = 25 * 1024 * 1024
 
 
@@ -40,6 +93,93 @@ async def _read_pdf(f: UploadFile):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+_diag_cache = {"t": 0, "v": None}
+
+
+def _check(fn):
+    t = time.time()
+    try:
+        msg = fn()
+        return {"ok": True, "detail": msg or "ok", "ms": int((time.time() - t) * 1000)}
+    except Exception as e:
+        return {"ok": False, "detail": f"{type(e).__name__}: {str(e)[:400]}", "ms": int((time.time() - t) * 1000)}
+
+
+@app.get("/diagnostics")
+def diagnostics(refresh: bool = False):
+    """Live connectivity test of every dependency. Open https://<your-render-url>/diagnostics after deploying.
+    Never returns secret values. Cached for 60 s because it makes a few tiny provider calls."""
+    if not refresh and _diag_cache["v"] and time.time() - _diag_cache["t"] < 60:
+        return _diag_cache["v"]
+    from .clients import brightdata as bd, gemini, scholarly as oa
+    from .clients.brightdata import UnlockerClient
+
+    def db():
+        r = one("SELECT (SELECT count(*) FROM pg_extension WHERE extname='vector') AS vec, "
+                "(SELECT count(*) FROM information_schema.tables WHERE table_name IN ('workspaces','papers','claims','claim_edges','paper_scores','flags','fetch_cache','chat_messages','impact_reports')) AS tables")
+        if not r["vec"]:
+            raise RuntimeError("pgvector extension is not installed (run: CREATE EXTENSION vector;)")
+        if r["tables"] < 9:
+            raise RuntimeError(f"only {r['tables']}/9 tables exist; schema not applied")
+        return "connected, pgvector present, 9/9 tables"
+
+    def gen():
+        if not C.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY not set")
+        try:
+            out = gemini.generate_json('Return JSON {"ok": true}')
+        except Exception as e:
+            raise RuntimeError(gemini.explain(e))
+        return f"{C.GEMINI_MODEL} responded ({out})"
+
+    def emb():
+        if not C.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY not set")
+        try:
+            v = gemini.embed(["test"])[0]
+        except Exception as e:
+            raise RuntimeError(gemini.explain(e))
+        if len(v) != 768:
+            raise RuntimeError(f"got {len(v)} dims; schema needs 768")
+        return f"{C.GEMINI_EMBED_MODEL}: {len(v)} dims"
+
+    def alex():
+        hits = oa.search_works("intelligent tutoring systems", 2)
+        if not hits:
+            raise RuntimeError("OpenAlex returned no results")
+        return f"{len(hits)} results" + ("" if C.OPENALEX_API_KEY else " (no OPENALEX_API_KEY set)")
+
+    def unl():
+        if not (C.BRIGHT_DATA_API_KEY and C.BRIGHT_DATA_UNLOCKER_ZONE):
+            raise RuntimeError("not configured (optional: Scholar lane and publisher full text are skipped)")
+        bd.reset_fatal()
+        text = UnlockerClient().fetch_text("https://arxiv.org/abs/1706.03762")
+        return f"fetched {len(text)} chars via zone '{C.BRIGHT_DATA_UNLOCKER_ZONE}'"
+
+    out = {
+        "config_problems": C.config_problems(),
+        "mode": "inline-thread" if C.RUN_INLINE else "redis-queue",
+        "models": {"generate": C.GEMINI_MODEL, "verify": C.GEMINI_VERIFY_MODEL, "embed": C.GEMINI_EMBED_MODEL},
+        "limits": {"max_papers": C.MAX_PAPERS, "max_pairs": C.MAX_PAIRS, "concurrency": C.WORKERS},
+        "checks": {"database": _check(db), "gemini_generate": _check(gen), "gemini_embed": _check(emb),
+                   "openalex": _check(alex), "bright_data": _check(unl)},
+    }
+    out["ok"] = not out["config_problems"] and all(v["ok"] for k, v in out["checks"].items() if k != "bright_data")
+    _diag_cache.update(t=time.time(), v=out)
+    return out
+
+
+@app.post("/workspaces/{ws}/retry")
+def retry_workspace(ws: str):
+    """Resume a failed/interrupted investigation. Completed stages are reused where the pipeline is idempotent."""
+    w = _need(one("SELECT status FROM workspaces WHERE id=%s", (ws,)))
+    if w["status"] not in ("error",):
+        raise HTTPException(409, f"Workspace is '{w['status']}', not failed.")
+    q("UPDATE workspaces SET status='queued', error=NULL WHERE id=%s", (ws,))
+    enqueue("run_workspace_job", ws)
+    return {"id": ws, "status": "queued"}
 
 
 @app.get("/workspaces")
