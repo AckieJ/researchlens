@@ -1,0 +1,31 @@
+# Tiger Data is external (set DATABASE_URL in .env). For a purely local database run:
+#   docker compose --profile localdb up --build   (and set DATABASE_URL=postgresql://postgres:postgres@db:5432/researchlens)
+services:
+  api:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    env_file: .env
+    command: sh -c "python -m app.init_db && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    depends_on: [redis]
+    restart: unless-stopped
+  worker:
+    build: { context: ., dockerfile: backend/Dockerfile }
+    env_file: .env
+    command: rq worker researchlens --url ${REDIS_URL:-redis://redis:6379/0}
+    depends_on: [redis, api]
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+  web:
+    build: ./frontend
+    ports: ["80:80"]
+    depends_on: [api]
+    restart: unless-stopped
+  db:
+    image: pgvector/pgvector:pg16
+    profiles: ["localdb"]
+    environment: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: researchlens }
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+volumes:
+  pgdata:

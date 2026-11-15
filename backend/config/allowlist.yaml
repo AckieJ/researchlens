@@ -1,0 +1,14 @@
+# Domains the retrieval layer may fetch through Bright Data Web Unlocker.
+# RULES (see README): public pages only, no login/paywall circumvention, check each
+# site's robots.txt and terms before adding it. An entry may include a path prefix.
+# Google Scholar is NOT listed here: it is reached only through the Scholar Scraper API.
+allow:
+  - ncbi.nlm.nih.gov/pmc
+  - europepmc.org
+  - www.ebi.ac.uk/europepmc
+  - arxiv.org
+  - biorxiv.org
+  - medrxiv.org
+  - doaj.org
+# Add open-access publisher domains for your demo topic below (or via EXTRA_ALLOWED_DOMAINS):
+extra: []
