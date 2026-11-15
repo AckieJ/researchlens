@@ -33,9 +33,10 @@ const get = async (p) => {
 }
 
 export const api = {
-  create: (question, files) => {
+  create: (question, files, fresh = false) => {
     const f = new FormData()
     f.append('question', question)
+    if (fresh) f.append('fresh', 'true')
     ;[...files].forEach((x) => f.append('files', x))
     return fetch(B + '/workspaces', { method: 'POST', body: f }).then(j)
   },

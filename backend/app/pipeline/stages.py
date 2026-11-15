@@ -3,18 +3,20 @@ import difflib
 import json
 import logging
 import re
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from .. import config as C
 from ..clients import gemini, scholarly as oa
 from ..clients.allowlist import allowed
+from ..clients import brightdata as bd
 from ..clients.brightdata import ScholarBlocked, ScholarClient, UnlockerClient
-from ..db import ex, one, q, vec
+from ..db import ex, exmany, one, pool, q, vec
 from . import prompts
 from .dedupe import dedupe
 from .layout import assign_angles, child_angles, evidence_strength, minmax, relevance
-from .text import comparability, find_doi, guess_title, jaccard, locate, normalize, passage, pdf_to_text, quote_ok
+from .text import comparability, find_doi, focus_text, guess_title, jaccard, locate, normalize, passage, pdf_to_text, quote_ok
 
 log = logging.getLogger("researchlens")
 
@@ -62,8 +64,8 @@ def insert_paper(ws, c, kept=False, expanded_from=None):
               f"VALUES (%s,{','.join(['%s'] * len(PCOLS))},%s,%s,%s,%s::jsonb) RETURNING id",
               (ws, *[d[k] for k in PCOLS], c.get("lane"), kept, expanded_from or c.get("_seed"),
                json.dumps(c["scholar_links"]) if c.get("scholar_links") else None))
-    for lane, query in c.get("sources") or [(c.get("lane"), c.get("query"))]:
-        add_source(row["id"], lane, query)
+    exmany("INSERT INTO paper_sources (paper_id,lane,query) VALUES (%s,%s,%s)",
+           [(row["id"], lane, query) for lane, query in c.get("sources") or [(c.get("lane"), c.get("query"))]])
     return row["id"]
 
 
@@ -86,17 +88,92 @@ def ingest_upload(ws, filename, content, is_new=False):
 
 
 # ---------- Stage 1 ----------
+def _clone_sql():
+    """Statements that copy one finished workspace into another, remapping every id (run in one transaction)."""
+    return [
+        "CREATE TEMP TABLE pm ON COMMIT DROP AS SELECT id AS o, gen_random_uuid() AS n FROM papers WHERE workspace_id=%(src)s::uuid",
+        "CREATE TEMP TABLE cm ON COMMIT DROP AS SELECT id AS o, gen_random_uuid() AS n FROM claims WHERE workspace_id=%(src)s::uuid",
+        "INSERT INTO papers (id,workspace_id,doi,openalex_id,title,year,authors,venue,url,oa_url,license,text_level,full_text,abstract,"
+         "retraction_status,cited_by_count,refs,lane,kept,is_upload,is_new,expanded_from,confidence,scholar_links,embedding) "
+         "SELECT pm.n,%(dst)s::uuid,p.doi,p.openalex_id,p.title,p.year,p.authors,p.venue,p.url,p.oa_url,p.license,p.text_level,p.full_text,p.abstract,"
+         "p.retraction_status,p.cited_by_count,p.refs,p.lane,p.kept,p.is_upload,p.is_new,"
+         "(SELECT x.n FROM pm x WHERE x.o=p.expanded_from),p.confidence,p.scholar_links,p.embedding "
+         "FROM papers p JOIN pm ON pm.o=p.id",
+        "INSERT INTO paper_sources (paper_id,lane,query,found_at) SELECT pm.n,s.lane,s.query,s.found_at FROM paper_sources s JOIN pm ON pm.o=s.paper_id",
+        "INSERT INTO claims (id,workspace_id,paper_id,claim_text,intervention,outcome,outcome_family,direction,significance,effect_size,"
+         "population,sample_n,design,duration,measure,limitations,quote,location,embedding) "
+         "SELECT cm.n,%(dst)s::uuid,pm.n,c.claim_text,c.intervention,c.outcome,c.outcome_family,c.direction,c.significance,c.effect_size,"
+         "c.population,c.sample_n,c.design,c.duration,c.measure,c.limitations,c.quote,c.location,c.embedding "
+         "FROM claims c JOIN cm ON cm.o=c.id JOIN pm ON pm.o=c.paper_id",
+        "INSERT INTO claim_edges (workspace_id,claim_a,claim_b,label,factors,confidence,reason,quotes,sim,comparability,impact) "
+         "SELECT %(dst)s::uuid,a.n,b.n,e.label,e.factors,e.confidence,e.reason,e.quotes,e.sim,e.comparability,e.impact "
+         "FROM claim_edges e JOIN cm a ON a.o=e.claim_a JOIN cm b ON b.o=e.claim_b WHERE e.workspace_id=%(src)s::uuid",
+        "INSERT INTO paper_scores (workspace_id,paper_id,relevance,sector,angle,parent_paper) "
+         "SELECT %(dst)s::uuid,pm.n,s.relevance,s.sector,s.angle,(SELECT x.n FROM pm x WHERE x.o=s.parent_paper) "
+         "FROM paper_scores s JOIN pm ON pm.o=s.paper_id WHERE s.workspace_id=%(src)s::uuid",
+        "INSERT INTO flags (workspace_id,kind,description,claim_ids) "
+         "SELECT %(dst)s::uuid,f.kind,f.description,ARRAY(SELECT cm.n FROM cm WHERE cm.o = ANY(f.claim_ids)) FROM flags f WHERE f.workspace_id=%(src)s::uuid",
+    ]
+
+
+def clone_workspace(src, dst):
+    """Copy a finished investigation (papers, claims, verdicts, flags, layout) into `dst` in one transaction."""
+    params = {"src": str(src), "dst": str(dst)}
+    with pool().connection() as c:
+        with c.transaction():
+            for sql in _clone_sql():
+                c.execute(sql, params)
+            c.execute("UPDATE workspaces d SET parsed=s.parsed FROM workspaces s WHERE s.id=%(src)s::uuid AND d.id=%(dst)s::uuid", params)
+
+
+def find_cached_workspace(ws):
+    """A finished, upload-free investigation of the same question (exact key) or a near-identical one (embedding)."""
+    me = one("SELECT question_key, embedding IS NOT NULL AS has_emb FROM workspaces WHERE id=%s", (ws,))
+    if not me or one("SELECT 1 AS x FROM papers WHERE workspace_id=%s LIMIT 1", (ws,)):
+        return None                                     # retrying a half-finished run, or the user uploaded PDFs: run fresh
+    return one(
+        "SELECT s.id, s.created_at, (s.question_key IS NOT NULL AND s.question_key = m.question_key) AS exact, "
+        "coalesce(1-(s.embedding <=> m.embedding), 0) AS sim FROM workspaces s, workspaces m "
+        "WHERE m.id=%s AND s.id <> m.id AND s.status='done' AND s.created_at > now() - make_interval(days => %s) "
+        "AND EXISTS (SELECT 1 FROM papers p WHERE p.workspace_id=s.id AND p.kept) "
+        "AND NOT EXISTS (SELECT 1 FROM papers p WHERE p.workspace_id=s.id AND (p.is_upload OR p.is_new)) "
+        "AND (s.question_key = m.question_key OR 1-(s.embedding <=> m.embedding) >= %s) "
+        "ORDER BY (s.question_key = m.question_key) DESC, sim DESC, s.created_at DESC LIMIT 1",
+        (ws, C.CACHE_DAYS, C.SEMANTIC_CACHE_THRESHOLD))
+
+
 def understand(ws):
-    w = one("SELECT question FROM workspaces WHERE id=%s", (ws,))
+    """Interpret the question. Returns the parsed dict, or None when a finished identical investigation was reused."""
+    w = one("SELECT question, progress FROM workspaces WHERE id=%s", (ws,))
     try:
-        parsed = gemini.generate_json(prompts.understand(w["question"]))
         emb = gemini.embed([w["question"]])[0]
+        ex("UPDATE workspaces SET embedding=%s::vector WHERE id=%s", (vec(emb), ws))
     except Exception as e:
         raise RuntimeError("Gemini call failed while interpreting the question. " + gemini.explain(e)) from e
-    parsed["search_queries"] = [s for s in parsed.get("search_queries") or [] if s][:5] or [w["question"]]
+    if C.REUSE_CACHE and not (w["progress"] or {}).get("fresh"):
+        try:                                             # a cache problem must never fail the run: fall through to a fresh analysis
+            hit = find_cached_workspace(ws)
+            if hit:
+                clone_workspace(hit["id"], ws)
+                progress(ws, cache_hit=True, cloned_from=str(hit["id"]), cache_exact=bool(hit["exact"]),
+                         cache_similarity=round(float(hit["sim"]), 4),
+                         cache_age_days=round((time.time() - hit["created_at"].timestamp()) / 86400, 1))
+                return None
+        except Exception:
+            log.exception("Workspace cache lookup/clone failed; running a fresh analysis")
+    try:
+        parsed = gemini.generate_json(prompts.understand(w["question"]))
+    except Exception as e:
+        raise RuntimeError("Gemini call failed while interpreting the question. " + gemini.explain(e)) from e
+    seen, qs = set(), []
+    for s_ in parsed.get("search_queries") or []:
+        if s_ and s_.strip().lower() not in seen:
+            seen.add(s_.strip().lower())
+            qs.append(s_.strip())
+    parsed["search_queries"] = qs[:5] or [w["question"]]
     parsed["sub_questions"] = [s for s in parsed.get("sub_questions") or [] if s][:6] or [w["question"]]
     parsed["outcome_families"] = [s for s in parsed.get("outcome_families") or [] if s][:5]
-    ex("UPDATE workspaces SET parsed=%s::jsonb, embedding=%s::vector WHERE id=%s", (json.dumps(parsed), vec(emb), ws))
+    ex("UPDATE workspaces SET parsed=%s::jsonb WHERE id=%s", (json.dumps(parsed), ws))
     return parsed
 
 
@@ -123,8 +200,12 @@ def resolve_scholar_item(it, lane="B", query=None):
 def discover(ws, parsed):
     question = one("SELECT question FROM workspaces WHERE id=%s", (ws,))["question"]
     existing = q("SELECT id,doi,title,year FROM papers WHERE workspace_id=%s", (ws,))
-    cands, warnings, scholar = [], [], ScholarClient()
-    queries = parsed["search_queries"] + [question]
+    warnings, scholar = [], ScholarClient()
+    queries, seen = [], set()
+    for qs in parsed["search_queries"] + [question]:          # order-preserving, case-insensitive de-dup
+        if qs.strip().lower() not in seen:
+            seen.add(qs.strip().lower())
+            queries.append(qs)
 
     def oa_search(qs):
         try:
@@ -132,26 +213,41 @@ def discover(ws, parsed):
         except Exception as e:
             return [], f"OpenAlex failed for '{qs[:40]}': {e}"
 
-    for found, warn in pmap(oa_search, queries, C.IO_WORKERS):      # API lane: all queries at once
-        cands.extend(found)
-        if warn:
-            warnings.append(warn)
-    for qs in queries:                                              # Scholar lane: sequential, rate limited
-        if scholar.enabled() and not scholar.blocked:
+    def scholar_lane():
+        """Runs in parallel with the OpenAlex lane. Pages are rate limited, but DOI resolution is fanned out."""
+        found, warns = [], []
+        for qs in queries[:C.SCHOLAR_QUERIES]:
             try:
-                for it in scholar.search(qs, 20):
-                    cands.append(resolve_scholar_item(it, "B", qs))
+                items = scholar.search(qs, 20)
             except ScholarBlocked as e:
-                warnings.append(f"Google Scholar lane stopped: {e}")
+                warns.append(f"Google Scholar lane stopped: {e}")
+                break
             except Exception as e:
-                warnings.append(f"Google Scholar fetch failed for '{qs[:40]}': {e}")
-    if not scholar.enabled():
+                warns.append(f"Google Scholar fetch failed for '{qs[:40]}': {e}")
+                continue
+            found.extend(pmap(lambda it, qs=qs: resolve_scholar_item(it, "B", qs), items, C.IO_WORKERS))
+            if not items:
+                warns.append(f"Google Scholar returned 0 parsable results for '{qs[:40]}' (page layout changed or a soft block).")
+        return found, warns
+
+    use_scholar = scholar.enabled()
+    with ThreadPoolExecutor(1) as side:
+        fut = side.submit(scholar_lane) if use_scholar else None
+        cands = []
+        for found, warn in pmap(oa_search, queries, C.IO_WORKERS):      # API lane: all queries at once
+            cands.extend(found)
+            if warn:
+                warnings.append(warn)
+        if fut:
+            found, warns = fut.result()
+            cands.extend(found)                                          # always appended after OpenAlex: stable order
+            warnings.extend(warns)
+    if not use_scholar:
         warnings.append("Google Scholar lane skipped: BRIGHT_DATA_API_KEY or Web Unlocker zone not set.")
     new, dups, extra = dedupe([c for c in cands if c.get("title")], existing)
     if not new and not existing:
         raise RuntimeError("No papers were found. " + (" | ".join(warnings[:3]) or "The search APIs returned nothing for this question; try rephrasing it."))
-    for c in new[:C.MAX_CANDIDATES]:
-        insert_paper(ws, c)
+    pmap(lambda c: insert_paper(ws, c), new[:C.MAX_CANDIDATES], C.IO_WORKERS)
     for pid, lane, query in extra:
         add_source(pid, lane, query)
     progress(ws, duplicates_removed=dups, candidates=min(len(new), C.MAX_CANDIDATES) + len(existing), warnings=warnings)
@@ -168,18 +264,25 @@ def reuse_paper_embeddings(ws):
        " WHERE p.workspace_id=%s::uuid AND p.embedding IS NULL AND o.k = coalesce(p.doi, lower(p.title))", (ws, ws))
 
 
+def _set_embeddings(table, rows, embs):
+    """One round trip for all rows instead of one UPDATE per row (each is a network hop to the hosted database)."""
+    if rows:
+        ex(f"UPDATE {table} t SET embedding = v.e::vector FROM unnest(%s::uuid[], %s::text[]) AS v(id, e) WHERE t.id = v.id",
+           ([str(r["id"]) for r in rows], [vec(e) for e in embs]))
+
+
 def embed_papers(ws):
     reuse_paper_embeddings(ws)
-    rows = q("SELECT id,title,abstract FROM papers WHERE workspace_id=%s AND embedding IS NULL", (ws,))
-    for r, e in zip(rows, gemini.embed([f"{r['title']}. {(r['abstract'] or '')[:C.EMBED_PAPER_CHARS]}" for r in rows])):
-        ex("UPDATE papers SET embedding=%s::vector WHERE id=%s", (vec(e), r["id"]))
+    rows = q("SELECT id,title,abstract FROM papers WHERE workspace_id=%s AND embedding IS NULL ORDER BY id", (ws,))
+    embs = gemini.embed([f"{r['title']}. {(r['abstract'] or '')[:C.EMBED_PAPER_CHARS]}" for r in rows])
+    _set_embeddings("papers", rows, embs)
 
 
 def prelim_rank(ws, cap):
     """Keep uploads plus the papers most similar to the question; returns the ranked kept ids."""
     rows = q("SELECT p.id, p.is_upload, 1-(p.embedding <=> w.embedding) AS sim FROM papers p "
              "JOIN workspaces w ON w.id=p.workspace_id WHERE p.workspace_id=%s AND p.embedding IS NOT NULL "
-             "ORDER BY p.is_upload DESC, sim DESC", (ws,))
+             "ORDER BY p.is_upload DESC, round((1-(p.embedding <=> w.embedding))::numeric, 5) DESC, coalesce(p.doi, lower(p.title))", (ws,))
     cap = max(cap, sum(1 for r in rows if r["is_upload"]))
     keep = [r["id"] for r in rows][:cap]
     ex("UPDATE papers SET kept = (id = ANY(%s::uuid[])) WHERE workspace_id=%s", ([str(k) for k in keep], ws))
@@ -187,44 +290,51 @@ def prelim_rank(ws, cap):
 
 
 def expand(ws, keep, seeds=5):
-    """Citation expansion around the top seeds -> the second ring of the graph."""
+    """Citation expansion around the top seeds -> the second ring of the graph. Seeds run in parallel; OpenAlex
+    'cited by' is the default (API, fast). Scholar expansion (5 s per page) is opt-in via SCHOLAR_EXPAND."""
     scholar = ScholarClient()
-    seed_rows = q("SELECT * FROM papers WHERE id = ANY(%s::uuid[]) AND NOT is_upload LIMIT %s", ([str(k) for k in keep[:seeds * 2]], seeds))
-    cands = []
-    for s in seed_rows:
-        links = s.get("scholar_links") or {}
+    seed_rows = q("SELECT * FROM papers WHERE id = ANY(%s::uuid[]) AND NOT is_upload", ([str(k) for k in keep[:seeds * 2]],))
+    order = {str(k): i for i, k in enumerate(keep)}
+    seed_rows = sorted(seed_rows, key=lambda r: order.get(str(r["id"]), 1e9))[:seeds]
+    use_scholar = C.SCHOLAR_EXPAND and scholar.enabled()
+
+    def grow(s):
+        out, links = [], s.get("scholar_links") or {}
         try:
-            if scholar.enabled() and not scholar.blocked and any(links.values()):
+            if use_scholar and not scholar.blocked and any(links.values()):
                 for kind, url in links.items():
                     if url:
                         for it in scholar.expand(url, 10):
                             c = resolve_scholar_item(it, "B", f"expansion:{kind}")
                             c["_seed"] = s["id"]
-                            cands.append(c)
+                            out.append(c)
             elif s["openalex_id"]:
                 for w in oa.citing(s["openalex_id"], 10):
                     w.update({"lane": "A", "query": "expansion:citing", "_seed": s["id"]})
-                    cands.append(w)
+                    out.append(w)
         except Exception as e:
             log.warning("expansion failed for %s: %s", s["title"], e)
+        return out
+
+    cands = [c for part in pmap(grow, seed_rows, C.IO_WORKERS if not use_scholar else 1) for c in part]
     existing = q("SELECT id,doi,title,year FROM papers WHERE workspace_id=%s", (ws,))
     new, dups, extra = dedupe([c for c in cands if c.get("title")], existing)
-    for c in new[:60]:
-        insert_paper(ws, c)
+    pmap(lambda c: insert_paper(ws, c), new[:60], C.IO_WORKERS)
     for pid, lane, query in extra:
         add_source(pid, lane, query)
     progress(ws, expanded=len(new[:60]))
 
 
 def retrieve_full_text(p):
-    """Order: uploaded PDF -> Europe PMC API -> OpenAlex OA URL / result URL via Web Unlocker (allowlisted) -> abstract."""
+    """Order: uploaded PDF -> Europe PMC API -> OpenAlex OA URL / result URL via Bright Data Web Unlocker (allowlisted) -> abstract.
+    Returns (text, level, source)."""
     if p.get("full_text") and len(p["full_text"]) >= C.FULL_TEXT_MIN:
-        return p["full_text"], "full"
+        return p["full_text"], "full", "uploaded"
     if p.get("doi"):
         try:
             t = oa.epmc_fulltext(p["doi"])
             if t and len(t) >= C.FULL_TEXT_MIN:
-                return t, "full"
+                return t, "full", "europepmc"
         except Exception as e:
             log.info("Europe PMC miss for %s: %s", p["doi"], e)
     unl = UnlockerClient()
@@ -234,23 +344,26 @@ def retrieve_full_text(p):
                 try:
                     t = unl.fetch_text(u)
                     if t and len(t) >= C.FULL_TEXT_MIN:
-                        return t, "full"
+                        return t, "full", "brightdata"
                 except Exception as e:
                     log.info("Unlocker miss for %s: %s", u, e)
-    return (p.get("abstract") or ""), "abstract"
+    return (p.get("abstract") or ""), "abstract", "abstract"
 
 
 def retrieve_all(ws):
-    rows = q("SELECT * FROM papers WHERE workspace_id=%s AND kept", (ws,))
+    rows = q("SELECT * FROM papers WHERE workspace_id=%s AND kept ORDER BY id", (ws,))
+    tally = {"uploaded": 0, "europepmc": 0, "brightdata": 0, "abstract": 0}
 
     def work(p):
         try:
-            text, level = retrieve_full_text(p)
+            text, level, src = retrieve_full_text(p)
         except Exception:
-            text, level = (p.get("full_text") or p.get("abstract") or ""), "abstract"
+            text, level, src = (p.get("full_text") or p.get("abstract") or ""), "abstract", "abstract"
+        tally[src] += 1
         ex("UPDATE papers SET full_text=%s, text_level=%s WHERE id=%s", (text, level, p["id"]))
 
     pmap(work, rows, C.IO_WORKERS)
+    progress(ws, text_sources=tally)
     ex("UPDATE papers SET kept=false WHERE workspace_id=%s AND kept AND coalesce(length(full_text),0) < 200", (ws,))
     # Scholar-only results that never resolved to a DOI stay out of verdicts unless full text was retrieved.
     ex("UPDATE papers SET kept=false WHERE workspace_id=%s AND kept AND confidence='low' AND text_level<>'full'", (ws,))
@@ -292,13 +405,14 @@ def reuse_claims(p):
 
 
 def extract_paper(p):
-    text = (p.get("full_text") or p.get("abstract") or "")[:C.MAX_TEXT_CHARS]
-    if len(text) < 200:
+    full = p.get("full_text") or p.get("abstract") or ""
+    if len(full) < 200:
         return 0, 0
     reused = reuse_claims(p)
     if reused:
         return reused, 0
-    nt, level = normalize(text), p.get("text_level") or "abstract"
+    text = focus_text(full, C.MAX_TEXT_CHARS)            # what the model reads (findings-rich passages first)
+    nt, level = normalize(full), p.get("text_level") or "abstract"   # what a quote must match: the whole paper
     prompt, valid, rejected, seen = prompts.extract(p, text, level), [], 0, set()
     for attempt in range(2):
         data = gemini.generate_json(prompt, system=prompts.EXTRACT_SYSTEM)
@@ -307,8 +421,8 @@ def extract_paper(p):
             if qt in seen:
                 continue
             seen.add(qt)
-            if quote_ok(qt, text, nt):                       # code-level verbatim check
-                c["location"] = locate(text, qt) or c.get("location")
+            if quote_ok(qt, full, nt):                       # code-level verbatim check
+                c["location"] = locate(full, qt) or c.get("location")
                 valid.append(c)
             else:
                 rejected += 1
@@ -328,14 +442,14 @@ def extract_paper(p):
 
 
 def embed_claims(ws):
-    rows = q("SELECT id,claim_text,outcome FROM claims WHERE workspace_id=%s AND embedding IS NULL", (ws,))
-    for r, e in zip(rows, gemini.embed([f"{r['claim_text']} (outcome: {r['outcome']})" for r in rows])):
-        ex("UPDATE claims SET embedding=%s::vector WHERE id=%s", (vec(e), r["id"]))
+    rows = q("SELECT id,claim_text,outcome FROM claims WHERE workspace_id=%s AND embedding IS NULL ORDER BY id", (ws,))
+    embs = gemini.embed([f"{r['claim_text']} (outcome: {r['outcome']})" for r in rows])
+    _set_embeddings("claims", rows, embs)
 
 
 def extract_all(ws):
     papers = q("SELECT * FROM papers WHERE workspace_id=%s AND kept AND NOT EXISTS "
-               "(SELECT 1 FROM claims c WHERE c.paper_id=papers.id)", (ws,))
+               "(SELECT 1 FROM claims c WHERE c.paper_id=papers.id) ORDER BY id", (ws,))
 
     errors = []
 
@@ -367,7 +481,7 @@ WHERE pa.workspace_id=%(ws)s AND pb.workspace_id=%(ws)s AND pa.kept AND pb.kept
   AND 1-(a.embedding <=> b.embedding) >= %(th)s
   AND (lower(coalesce(a.outcome_family,'')) = lower(coalesce(b.outcome_family,'')) OR 1-(a.embedding <=> b.embedding) >= %(strong)s)
   AND NOT EXISTS (SELECT 1 FROM claim_edges e WHERE (e.claim_a=a.id AND e.claim_b=b.id) OR (e.claim_a=b.id AND e.claim_b=a.id))
-ORDER BY sim DESC LIMIT %(lim)s
+ORDER BY round((1-(a.embedding <=> b.embedding))::numeric, 5) DESC, least(a.quote, b.quote), greatest(a.quote, b.quote) LIMIT %(lim)s
 """
 
 
@@ -383,7 +497,7 @@ def reuse_verdict(a, b):
         return None
     return one("SELECT e.label, e.factors, e.confidence, e.reason FROM claim_edges e "
                "JOIN claims ca ON ca.id=e.claim_a JOIN claims cb ON cb.id=e.claim_b "
-               "WHERE e.workspace_id <> %s::uuid AND ca.quote = %s AND cb.quote = %s AND e.label IS NOT NULL LIMIT 1",
+               "WHERE e.workspace_id <> %s::uuid AND md5(ca.quote) = md5(%s) AND md5(cb.quote) = md5(%s) AND e.label IS NOT NULL ORDER BY e.id LIMIT 1",
                (a["workspace_id"], a["quote"], b["quote"]))
 
 
@@ -428,6 +542,7 @@ def verify_pairs(ws, pairs):
     if not ids:
         return []
     claims = {str(r["id"]): r for r in q(CLAIM_Q, (ids,))}
+    pairs = sorted(pairs, key=lambda p: (-float(p["sim"]), str(p["a_id"]), str(p["b_id"])))
 
     def work(p):
         try:
@@ -552,41 +667,77 @@ def compute_layout(ws):
         for cid, a in zip(sorted(ch, key=lambda i: -rel[i]), child_angles(base, len(ch))):
             angle[cid], parent[cid], sector[cid] = a, par, sector.get(par, sector[cid])
     ex("DELETE FROM paper_scores WHERE workspace_id=%s", (ws,))
-    for i in ids:
-        ex("INSERT INTO paper_scores (workspace_id,paper_id,relevance,sector,angle,parent_paper) VALUES (%s,%s,%s,%s,%s,%s)",
-           (ws, i, rel[i], sector[i], angle.get(i, 0.0), parent.get(i)))
+    exmany("INSERT INTO paper_scores (workspace_id,paper_id,relevance,sector,angle,parent_paper) VALUES (%s,%s,%s,%s,%s,%s)",
+           [(ws, i, rel[i], sector[i], angle.get(i, 0.0), parent.get(i)) for i in ids])
 
 
 # ---------- orchestration ----------
+class Timer:
+    """Records seconds spent per stage in workspaces.progress.timings (visible in /workspaces/<id>/status)."""
+
+    def __init__(self, ws):
+        self.ws, self.name, self.t, self.d = ws, None, time.time(), {}
+
+    def to(self, name, status=None):
+        self.close()
+        self.name, self.t = name, time.time()
+        if status:
+            set_status(self.ws, status)
+
+    def close(self):
+        if self.name:
+            self.d[self.name] = round(time.time() - self.t, 1)
+            progress(self.ws, timings=self.d)
+            self.name = None
+
+
+def _bd_progress(ws, before):
+    now = bd.snapshot()
+    progress(ws, bright_data={k: now[k] - before.get(k, 0) for k in now})
+
+
 def run_workspace(ws):
+    tm, bd0 = Timer(ws), bd.snapshot()
     try:
         set_status(ws, "understanding")
+        tm.to("understand")
         parsed = understand(ws)
-        set_status(ws, "discovering")
+        if parsed is None:                              # identical investigation already finished: reused, nothing to compute
+            tm.close()
+            set_status(ws, "done")
+            return
+        tm.to("discover", "discovering")
         discover(ws, parsed)
-        set_status(ws, "retrieving")
+        _bd_progress(ws, bd0)
+        tm.to("embed_rank", "retrieving")
         embed_papers(ws)
         keep = prelim_rank(ws, C.MAX_PAPERS)
+        tm.to("expand")
         expand(ws, keep)
         embed_papers(ws)
         prelim_rank(ws, C.MAX_PAPERS)
+        tm.to("retrieve_text")
         retrieve_all(ws)
-        set_status(ws, "extracting")
+        _bd_progress(ws, bd0)
+        tm.to("extract_claims", "extracting")
         extract_all(ws)
-        set_status(ws, "matching")
+        tm.to("match", "matching")
         pairs = match(ws)
         progress(ws, candidate_pairs=len(pairs))
-        set_status(ws, "verifying")
+        tm.to("verify", "verifying")
         verify_pairs(ws, pairs)
         external_check(ws)
-        set_status(ws, "flagging")
+        tm.to("flags", "flagging")
         build_flags(ws)
-        set_status(ws, "layout")
+        tm.to("layout", "layout")
         compute_layout(ws)
+        tm.close()
+        _bd_progress(ws, bd0)
         set_status(ws, "done")
     except Exception as e:
         log.error("workspace %s failed\n%s", ws, traceback.format_exc())
         try:
+            tm.close()
             set_status(ws, "error", str(e)[:1500])
         except Exception:
             log.exception("could not record error status")

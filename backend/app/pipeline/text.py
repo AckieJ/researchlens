@@ -117,3 +117,37 @@ def xml_to_text(xml):
     soup = BeautifulSoup(xml or "", "lxml-xml")
     root = soup.find("body") or soup
     return re.sub(r"\n{3,}", "\n\n", root.get_text("\n"))
+
+
+def question_key(question):
+    """Stable key for 'the same question': case, punctuation and spacing do not matter."""
+    import hashlib
+    norm = " ".join(re.sub(r"[^a-z0-9 ]", " ", unicodedata.normalize("NFKC", question or "").casefold()).split())
+    return hashlib.sha256(norm.encode()).hexdigest()
+
+
+_CUES = re.compile(r"(p\s*[<=>\u2264]\s*0?\.\d|\d\s*%|signific|improv|increas|decreas|reduc|differ|effect|outperform|compared|"
+                   r"correlat|\bn\s*=|conclu|result|found that|showed)", re.I)
+
+
+def focus_text(text, limit):
+    """Shrink a long paper to `limit` characters for the extractor without losing the findings: keep the opening
+    (abstract/intro) and the passages richest in result language, in original order. Deterministic.
+    Quotes are still validated against the FULL text, so nothing here can make an invalid quote pass."""
+    if len(text) <= limit:
+        return text
+    head_n = limit // 4
+    head, rest = text[:head_n], text[head_n:]
+    sents = re.split(r"(?<=[.!?])\s+", rest)
+    windows = [" ".join(sents[i:i + 6]) for i in range(0, len(sents), 6)]
+    scored = sorted(range(len(windows)), key=lambda i: (-len(_CUES.findall(windows[i])), i))
+    budget, keep = limit - head_n, set()
+    for i in scored:
+        n = len(windows[i]) + 5
+        if n > budget:
+            continue
+        keep.add(i)
+        budget -= n
+        if budget < 300:
+            break
+    return head + "".join("\n...\n" + windows[i] for i in sorted(keep))

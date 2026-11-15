@@ -197,3 +197,6 @@ html{scroll-behavior:smooth}body{font-family:var(--sans);background:var(--bg);co
 @media(max-width:600px){.map-toolbar{padding:12px}.map-top-row{gap:9px}.map-search-field{min-width:100%}.map-minrel{width:100%;justify-content:space-between}.map-filter-row{gap:5px}.map-filter-chip{font-size:9px}.map-filter-caption{width:100%}.live-dashboard .map-canvas{height:470px}.map-top-hint{font-size:9px;top:9px;left:9px;padding:7px}.map-scale-hint{font-size:9px;left:9px;bottom:9px;max-width:230px}.map-tools{bottom:40px;right:9px}.live-dashboard .inspector-panel{height:560px}}
 
 @media(min-width:1171px){.live-dashboard .dashboard-content{grid-template-columns:minmax(0,1fr) minmax(365px,410px)}}
+
+.fresh-toggle{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;color:var(--muted,#5b6b78);cursor:pointer}
+.fresh-toggle input{accent-color:var(--teal,#2f7f79)}

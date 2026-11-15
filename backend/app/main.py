@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 import time
@@ -14,6 +15,7 @@ from .jobs import enqueue
 from .pipeline import chat as chat_mod
 from .pipeline import graph as G
 from .pipeline import stages
+from .pipeline.text import question_key
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -190,12 +192,13 @@ def list_workspaces():
 
 
 @app.post("/workspaces")
-async def create_workspace(question: str = Form(...), files: list[UploadFile] = File(default=[])):
+async def create_workspace(question: str = Form(...), fresh: bool = Form(False), files: list[UploadFile] = File(default=[])):
     question = question.strip()
     if len(question) < 8:
         raise HTTPException(400, "Enter a research question of at least a few words.")
     blobs = [(f.filename, await _read_pdf(f)) for f in files]
-    ws = one("INSERT INTO workspaces (question) VALUES (%s) RETURNING id", (question,))["id"]
+    ws = one("INSERT INTO workspaces (question, question_key, progress) VALUES (%s,%s,%s::jsonb) RETURNING id",
+             (question, question_key(question), json.dumps({"fresh": bool(fresh)})))["id"]
     for name, data in blobs:
         stages.ingest_upload(ws, name, data)
     try:

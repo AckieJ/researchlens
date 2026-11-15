@@ -11,12 +11,13 @@ export default function Setup({ onCreated, onOpen }) {
   const [question, setQuestion] = useState('')
   const [files, setFiles] = useState([])
   const [busy, setBusy] = useState(false)
+  const [fresh, setFresh] = useState(false)
   const [error, setError] = useState('')
   const fileRef = useRef(null)
   const submit = async (e) => {
     e.preventDefault()
     setBusy(true); setError('')
-    try { onCreated((await api.create(question, files)).id) } catch (err) { setError(err.message); setBusy(false) }
+    try { onCreated((await api.create(question, files, fresh)).id) } catch (err) { setError(err.message); setBusy(false) }
   }
   return <div className="app-shell">
     <header className="site-header wrap">
@@ -41,6 +42,7 @@ export default function Setup({ onCreated, onOpen }) {
               <input ref={fileRef} className="sr-only" type="file" accept="application/pdf" multiple onChange={e => setFiles([...e.target.files])}/>
               <button className="primary search-submit" disabled={busy || question.trim().length < 8}>{busy ? 'Starting…' : 'Investigate'} <span>↗</span></button>
             </div>
+            <label className="fresh-toggle"><input type="checkbox" checked={fresh} onChange={e => setFresh(e.target.checked)}/> Re-run from scratch (ignore saved results for this question)</label>
             {error && <div className="inline-error" role="alert">{error}. Check the API connection and try again.</div>}
           </form>
           <p className="privacy-hint">✦ Sources are linked to original studies. Your uploaded PDFs are limited to your workspace.</p>

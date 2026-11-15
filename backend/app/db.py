@@ -40,3 +40,12 @@ def ex(sql, params=None):
 
 def vec(v):
     return "[" + ",".join(f"{float(x):.6f}" for x in v) + "]"
+
+
+def exmany(sql, rows):
+    """Run one statement for many parameter rows in a single round trip (psycopg pipelines executemany)."""
+    if not rows:
+        return
+    with pool().connection() as c:
+        with c.cursor() as cur:
+            cur.executemany(sql, rows)

@@ -100,3 +100,23 @@ SELECT e.workspace_id,
        e.label, count(*) AS n
 FROM claim_edges e JOIN claims ca ON ca.id = e.claim_a JOIN claims cb ON cb.id = e.claim_b
 GROUP BY 1, 2, 3, 4;
+
+-- ---- Speed + consistency additions (idempotent) ----
+-- Same question text -> same answer: key for exact reuse; embedding index for near-identical questions.
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS question_key text;
+CREATE INDEX IF NOT EXISTS workspaces_key_idx ON workspaces(question_key);
+CREATE INDEX IF NOT EXISTS workspaces_emb_idx ON workspaces USING hnsw (embedding vector_cosine_ops);
+
+-- Identical model input -> identical output (and no second API call). Keyed by sha256 of model + settings + prompt.
+CREATE TABLE IF NOT EXISTS llm_cache (
+  key text PRIMARY KEY, response jsonb NOT NULL, created_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS embed_cache (
+  key text PRIMARY KEY, embedding vector(768) NOT NULL
+);
+
+-- Indexes for the cross-workspace reuse lookups and the pair-matching NOT EXISTS check.
+CREATE INDEX IF NOT EXISTS papers_key_idx ON papers ((coalesce(doi, lower(title))));
+CREATE INDEX IF NOT EXISTS edges_claim_b_idx ON claim_edges(claim_b);
+CREATE INDEX IF NOT EXISTS papers_ws_kept_idx ON papers(workspace_id) WHERE kept;
+CREATE INDEX IF NOT EXISTS claims_quote_idx ON claims (md5(quote));

@@ -45,8 +45,14 @@ EMBED_DIM = _i("EMBED_DIM", 768)
 # Free-tier embedding quota is ~30,000 tokens per minute. Stay under it by pacing requests.
 EMBED_TOKENS_PER_MIN = _i("EMBED_TOKENS_PER_MIN", 22000)
 EMBED_PAPER_CHARS = _i("EMBED_PAPER_CHARS", 1200)   # abstract characters embedded per paper
-# Gemini 3.x models recommend leaving temperature at its default; set GEMINI_TEMPERATURE=0 to force it.
-GEMINI_TEMPERATURE = _env("GEMINI_TEMPERATURE", default="")
+# Consistency: temperature 0 + a fixed seed by default. Set GEMINI_TEMPERATURE=default to leave the model's own default.
+GEMINI_TEMPERATURE = _env("GEMINI_TEMPERATURE", default="0")
+GEMINI_SEED = _i("GEMINI_SEED", 7)
+# Gemini 2.5 Flash "thinking" tokens add seconds per call; extraction/verification here do not need them. -1 = model default.
+GEMINI_THINKING_BUDGET = _i("GEMINI_THINKING_BUDGET", 0)
+# Requests per minute allowed to Gemini generation (0 = no client-side limit). Set this to your plan's RPM
+# (free tier is roughly 10) so we pace calls instead of hitting 429 and sleeping 30+ seconds per retry.
+GEMINI_RPM = _i("GEMINI_RPM", 0)
 
 BRIGHT_DATA_API_KEY = _env("BRIGHT_DATA_API_KEY")
 BRIGHT_DATA_UNLOCKER_ZONE = _env("BRIGHT_DATA_UNLOCKER_ZONE")
@@ -54,6 +60,8 @@ BRIGHT_DATA_UNLOCKER_ZONE = _env("BRIGHT_DATA_UNLOCKER_ZONE")
 BRIGHT_DATA_SCHOLAR_ZONE = _env("BRIGHT_DATA_SCHOLAR_ZONE")
 SCHOLAR_MIN_INTERVAL = _f("SCHOLAR_MIN_INTERVAL", 5)   # seconds between Scholar requests
 SCHOLAR_MAX_REQUESTS = _i("SCHOLAR_MAX_REQUESTS", 20)     # per client instance (per pipeline stage)
+SCHOLAR_QUERIES = _i("SCHOLAR_QUERIES", 2)                # only the first N search queries go to Scholar (it runs in parallel with OpenAlex)
+SCHOLAR_EXPAND = _b("SCHOLAR_EXPAND", False)              # citation expansion via Scholar (slow, 5 s per page); default uses OpenAlex "cited by"
 
 OPENALEX_API_KEY = _env("OPENALEX_API_KEY")
 # Optional contact email for User-Agent; no longer an authentication mechanism.
@@ -69,7 +77,10 @@ IO_WORKERS = _i("IO_CONCURRENCY", 6)          # parallel full-text / API fetches
 # Reuse work done in earlier workspaces: paper embeddings, extracted claims, and verdicts for identical quote pairs.
 # Set REUSE_CACHE=false after changing GEMINI_EMBED_MODEL, the extraction prompt, or the verification rules.
 REUSE_CACHE = _b("REUSE_CACHE", True)
-MAX_TEXT_CHARS = _i("MAX_TEXT_CHARS", 100000)
+MAX_TEXT_CHARS = _i("MAX_TEXT_CHARS", 40000)   # characters of a paper sent to the extractor (result-heavy passages are kept first)
+# Whole-investigation reuse: a finished workspace for the same (or a near-identical) question is cloned instead of re-run.
+CACHE_DAYS = _i("CACHE_DAYS", 30)
+SEMANTIC_CACHE_THRESHOLD = _f("SEMANTIC_CACHE_THRESHOLD", 0.97)
 FULL_TEXT_MIN = 3000   # fewer characters than this = treat as abstract-only
 
 ALLOWLIST_PATH = os.getenv("ALLOWLIST_PATH", os.path.join(os.path.dirname(__file__), "..", "config", "allowlist.yaml"))

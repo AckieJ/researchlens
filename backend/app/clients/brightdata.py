@@ -23,6 +23,20 @@ from .util import retry
 
 _last = {}
 _lock = threading.Lock()
+# Usage counters so the UI / status endpoint can show whether Bright Data is really being used.
+STATS = {"scholar_requests": 0, "scholar_cache_hits": 0, "scholar_blocked": 0,
+         "unlocker_requests": 0, "unlocker_cache_hits": 0}
+
+
+def bump(key, n=1):
+    with _lock:
+        STATS[key] = STATS.get(key, 0) + n
+
+
+def snapshot():
+    with _lock:
+        return dict(STATS)
+
 SCHOLAR_HOST = "scholar.google.com"
 
 
@@ -97,7 +111,9 @@ class UnlockerClient:
         h = hashlib.sha256(url.encode()).hexdigest()
         cached = _cache_get(h)
         if cached is not None:
+            bump("unlocker_cache_hits")
             return cached
+        bump("unlocker_requests")
         _throttle(urlparse(url).netloc)
         r = _unlock(url, C.BRIGHT_DATA_UNLOCKER_ZONE)
         text = pdf_to_text(r.content) if r.content[:5] == b"%PDF-" else html_to_text(r.text)
@@ -123,14 +139,17 @@ class ScholarClient:
         key = hashlib.sha256(("scholar:" + url).encode()).hexdigest()
         cached = _cache_get(key)
         if cached is not None:
+            bump("scholar_cache_hits")
             return cached
         if self.requests >= C.SCHOLAR_MAX_REQUESTS:
             raise RuntimeError(f"Scholar request cap reached ({C.SCHOLAR_MAX_REQUESTS})")
         self.requests += 1
+        bump("scholar_requests")
         _throttle(SCHOLAR_HOST, C.SCHOLAR_MIN_INTERVAL)
         html = _unlock(url, C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE).text
         if looks_blocked(html):
             self.blocked = True
+            bump("scholar_blocked")
             raise ScholarBlocked("Google Scholar returned a CAPTCHA / unusual-traffic page")
         _cache_put(key, url, html)
         return html
