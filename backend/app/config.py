@@ -42,6 +42,9 @@ GEMINI_VERIFY_MODEL = _env("GEMINI_VERIFY_MODEL", default=GEMINI_MODEL)
 # EMBEDDING_MODEL is accepted as an alias of GEMINI_EMBED_MODEL
 GEMINI_EMBED_MODEL = _env("GEMINI_EMBED_MODEL", "EMBEDDING_MODEL", default="gemini-embedding-001")
 EMBED_DIM = _i("EMBED_DIM", 768)
+# Free-tier embedding quota is ~30,000 tokens per minute. Stay under it by pacing requests.
+EMBED_TOKENS_PER_MIN = _i("EMBED_TOKENS_PER_MIN", 22000)
+EMBED_PAPER_CHARS = _i("EMBED_PAPER_CHARS", 1200)   # abstract characters embedded per paper
 # Gemini 3.x models recommend leaving temperature at its default; set GEMINI_TEMPERATURE=0 to force it.
 GEMINI_TEMPERATURE = _env("GEMINI_TEMPERATURE", default="")
 

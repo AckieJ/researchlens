@@ -153,7 +153,7 @@ def discover(ws, parsed):
 
 def embed_papers(ws):
     rows = q("SELECT id,title,abstract FROM papers WHERE workspace_id=%s AND embedding IS NULL", (ws,))
-    for r, e in zip(rows, gemini.embed([f"{r['title']}. {r['abstract'] or ''}" for r in rows])):
+    for r, e in zip(rows, gemini.embed([f"{r['title']}. {(r['abstract'] or '')[:C.EMBED_PAPER_CHARS]}" for r in rows])):
         ex("UPDATE papers SET embedding=%s::vector WHERE id=%s", (vec(e), r["id"]))
 
 
