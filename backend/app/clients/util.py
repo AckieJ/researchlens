@@ -13,6 +13,8 @@ def _code(exc):
 
 def _permanent(exc):
     """HTTP 4xx (except 408/429) will not succeed on retry: fail fast instead of burning time and quota."""
+    if getattr(exc, "no_retry", False):
+        return True
     code = _code(exc)
     return isinstance(code, int) and 400 <= code < 500 and code not in (408, 429)
 

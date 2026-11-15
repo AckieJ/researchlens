@@ -18,7 +18,7 @@ from .. import config as C
 from ..db import ex, one
 from ..pipeline.text import html_to_text, pdf_to_text
 from .allowlist import allowed
-from .scholar_parse import BASE, looks_blocked, parse_scholar_html
+from .scholar_parse import BASE, describe, fingerprint, parse_scholar_html
 from .util import retry
 
 _last = {}
@@ -122,47 +122,71 @@ class UnlockerClient:
 
 
 class ScholarClient:
-    """Create one per pipeline stage; the request cap and the 'blocked' flag live on the instance."""
+    """Create one per pipeline stage; the request cap and the 'blocked' flag live on the instance.
+
+    Pages are cached only when they contain parsable results, so a CAPTCHA, consent wall or changed layout is never
+    remembered for a week. The first unusable page stops the lane for this run and says what it saw."""
 
     def __init__(self):
         self.requests = 0
         self.blocked = False
+        self.failed = None          # reason string once a page was unusable
+        self.last = None            # fingerprint of the most recent page
 
     def enabled(self):
         return bool(C.BRIGHT_DATA_API_KEY and (C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE) and not _fatal["msg"])
 
-    def _page(self, url):
+    def describe_last(self):
+        return describe(self.last)
+
+    def _fetch(self, url):
+        """Return (html, cache_key, from_cache). Raises ScholarBlocked for CAPTCHA/consent/JS walls and after an unusable page."""
         if urlparse(url).hostname != SCHOLAR_HOST:
             raise NotAllowed(url)
-        if self.blocked:
-            raise ScholarBlocked("Google Scholar showed a CAPTCHA earlier in this run")
-        key = hashlib.sha256(("scholar:" + url).encode()).hexdigest()
+        if self.blocked or self.failed:
+            raise ScholarBlocked(self.failed or "Google Scholar showed a CAPTCHA earlier in this run")
+        key = hashlib.sha256(("scholar2:" + url).encode()).hexdigest()     # scholar2: = only good pages are stored
         cached = _cache_get(key)
         if cached is not None:
             bump("scholar_cache_hits")
-            return cached
+            return cached, key, True
         if self.requests >= C.SCHOLAR_MAX_REQUESTS:
             raise RuntimeError(f"Scholar request cap reached ({C.SCHOLAR_MAX_REQUESTS})")
         self.requests += 1
         bump("scholar_requests")
         _throttle(SCHOLAR_HOST, C.SCHOLAR_MIN_INTERVAL)
         html = _unlock(url, C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE).text
-        if looks_blocked(html):
+        return html, key, False
+
+    def _results(self, url, limit):
+        html, key, cached = self._fetch(url)
+        items = parse_scholar_html(html)[:limit]
+        self.last = fingerprint(html)
+        if items:
+            if not cached:
+                _cache_put(key, url, html)
+            return items
+        flags = self.last["flags"]
+        if "captcha" in flags or "consent wall" in flags or "javascript wall" in flags or "not a Scholar page" in flags:
             self.blocked = True
             bump("scholar_blocked")
-            raise ScholarBlocked("Google Scholar returned a CAPTCHA / unusual-traffic page")
-        _cache_put(key, url, html)
-        return html
+            self.failed = f"Google Scholar did not serve results ({describe(self.last)})"
+            raise ScholarBlocked(self.failed)
+        if "no matching articles" not in flags:                              # a page with no results and no explanation
+            bump("scholar_blocked")
+            self.failed = f"Google Scholar page could not be parsed ({describe(self.last)})"
+            raise ScholarBlocked(self.failed)
+        return []                                                            # a legitimate empty search
 
     def search(self, query, limit=20):
-        url = f"{BASE}scholar?q={quote_plus(query)}&hl=en&as_sdt=0,5&as_vis=1&num={min(max(limit, 1), 20)}"
-        return parse_scholar_html(self._page(url))[:limit]
+        url = f"{BASE}scholar?q={quote_plus(query)}&hl=en&gl=us&as_sdt=0,5&as_vis=1&num={min(max(limit, 1), 20)}"
+        return self._results(url, limit)
 
     def expand(self, url, limit=10):
         """Follow a cited-by or related-articles link returned by an earlier search."""
         url = urljoin(BASE, url)
         url += ("&" if "?" in url else "?") + f"num={min(max(limit, 1), 20)}"
-        return parse_scholar_html(self._page(url))[:limit]
+        return self._results(url, limit)
 
 
 def fatal_message():

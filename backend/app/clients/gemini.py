@@ -23,11 +23,43 @@ def client():
     return _client
 
 
+class BadModelReply(ValueError):
+    """The model answered, but not with usable JSON. With temperature 0 and a fixed seed an identical retry would
+    reproduce the same text, so retry() must not repeat it; generate_json re-asks once with a changed seed instead."""
+    no_retry = True
+
+
 def parse_json(text):
+    """Parse the model's reply. Tolerates code fences, text around the JSON, and the model emitting several JSON
+    objects back to back ('Extra data' errors): the first value is used, and dict replies are merged key by key."""
     t = (text or "").strip()
     t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
-    a, b = t.find("{"), t.rfind("}")
-    return json.loads(t[a:b + 1] if a >= 0 and b > a else t)
+    dec, vals, i = json.JSONDecoder(), [], 0
+    while i < len(t):
+        starts = [x for x in (t.find("{", i), t.find("[", i)) if x >= 0]
+        if not starts:
+            break
+        j = min(starts)
+        try:
+            v, end = dec.raw_decode(t, j)
+        except json.JSONDecodeError:
+            i = j + 1
+            continue
+        vals.append(v)
+        i = end
+    if not vals:
+        raise json.JSONDecodeError("no JSON value found in the model reply", t, 0)
+    dicts = [v for v in vals if isinstance(v, dict)]
+    if len(dicts) > 1:
+        merged = {}
+        for d in dicts:
+            for k, v in d.items():
+                if isinstance(v, list) and isinstance(merged.get(k), list):
+                    merged[k] = merged[k] + v
+                else:
+                    merged.setdefault(k, v)
+        return merged
+    return dicts[0] if dicts else vals[0]
 
 
 def _as_object(data, list_key=None):
@@ -92,10 +124,68 @@ def _cache_put(key, value):
         log.warning("llm_cache write failed", exc_info=True)
 
 
+STATS = {"llm_calls": 0, "llm_cache_hits": 0, "llm_bad_replies": 0, "llm_seconds": 0.0}
+_THINKING_OFF = set()      # models that rejected our thinking setting (we stop sending it)
+
+
+def snapshot():
+    with _gate_lock:
+        return {k: (round(v, 1) if isinstance(v, float) else v) for k, v in STATS.items()}
+
+
+def _bump(key, n=1):
+    with _gate_lock:
+        STATS[key] += n
+
+
+def _thinking_config(model):
+    from google.genai import types
+    if model in _THINKING_OFF:
+        return None
+    if model.startswith("gemini-2.5") and "pro" not in model and C.GEMINI_THINKING_BUDGET >= 0:
+        return types.ThinkingConfig(thinking_budget=C.GEMINI_THINKING_BUDGET)
+    if model.startswith("gemini-3") and C.GEMINI_THINKING_LEVEL:
+        return types.ThinkingConfig(thinking_level=C.GEMINI_THINKING_LEVEL.lower())
+    return None
+
+
+def _request(model, system, prompt, kw):
+    from google.genai import types
+    tc = _thinking_config(model)
+    for with_thinking in ((True, False) if tc is not None else (False,)):
+        cfg = dict(kw)
+        if with_thinking:
+            cfg["thinking_config"] = tc
+        try:
+            return client().models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(system_instruction=system, response_mime_type="application/json", **cfg))
+        except Exception as e:
+            if with_thinking and getattr(e, "code", None) == 400 and "think" in str(e).lower():
+                log.warning("%s rejected the thinking setting (%s); sending requests without it from now on", model, str(e)[:160])
+                _THINKING_OFF.add(model)
+                continue
+            raise
+
+
+def _once(model, system, prompt, kw, list_key):
+    def call():
+        _pace()
+        t0 = time.time()
+        r = _request(model, system, prompt, kw)
+        _bump("llm_calls")
+        _bump("llm_seconds", time.time() - t0)
+        try:
+            return _as_object(parse_json(r.text), list_key)
+        except ValueError as e:                      # includes JSONDecodeError
+            _bump("llm_bad_replies")
+            raise BadModelReply(f"unusable JSON from {model}: {str(e)[:120]}") from e
+    return retry(call, tries=5)
+
+
 def generate_json(prompt, system=None, model=None, cache=True, list_key=None):
     """JSON generation. Deterministic settings, and identical (model, settings, system, prompt) input is answered from the
     database: the same question always sees the same interpretation, claims and verdicts, and costs no API call."""
-    from google.genai import types
     model = model or C.GEMINI_MODEL
     kw = _gen_settings()
     use_cache = cache and C.REUSE_CACHE
@@ -103,19 +193,18 @@ def generate_json(prompt, system=None, model=None, cache=True, list_key=None):
     if key:
         hit = _cache_get(key)
         if hit is not None:
+            _bump("llm_cache_hits")
             return hit
-
-    def call():
-        _pace()
-        cfg = dict(kw)
-        if C.GEMINI_THINKING_BUDGET >= 0 and model.startswith("gemini-2.5") and "pro" not in model:
-            cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=C.GEMINI_THINKING_BUDGET)
-        r = client().models.generate_content(
-            model=model, contents=prompt,
-            config=types.GenerateContentConfig(system_instruction=system, response_mime_type="application/json", **cfg))
-        return _as_object(parse_json(r.text), list_key)
-
-    out = retry(call, tries=5)
+    try:
+        out = _once(model, system, prompt, kw, list_key)
+    except BadModelReply as first:
+        # temperature 0 + a fixed seed would give the same malformed text again, so change the seed and tighten the instruction once.
+        log.warning("%s; re-asking once with a different seed", first)
+        kw2 = dict(kw)
+        if "seed" in kw2:
+            kw2["seed"] = int(kw2["seed"]) + 1
+        out = _once(model, system, prompt + "\n\nReturn exactly ONE valid JSON object and nothing else. Keep every string value short.",
+                    kw2, list_key)
     if key:
         _cache_put(key, out)
     return out

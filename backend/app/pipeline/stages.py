@@ -235,7 +235,7 @@ def discover(ws, parsed):
                 continue
             found.extend(pmap(lambda it, qs=qs: resolve_scholar_item(it, "B", qs), items, C.IO_WORKERS))
             if not items:
-                warns.append(f"Google Scholar returned 0 parsable results for '{qs[:40]}' (page layout changed or a soft block).")
+                warns.append(f"Google Scholar found no matching articles for '{qs[:40]}'.")
         return found, warns
 
     use_scholar = scholar.enabled()
@@ -752,7 +752,7 @@ def _count_critical_kept(ws, crit_queries):
 
 def _bd_progress(ws, before):
     now = bd.snapshot()
-    progress(ws, bright_data={k: now[k] - before.get(k, 0) for k in now})
+    progress(ws, bright_data={k: now[k] - before.get(k, 0) for k in now}, llm=gemini.snapshot())
 
 
 def run_workspace(ws):

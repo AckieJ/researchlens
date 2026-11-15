@@ -50,6 +50,9 @@ GEMINI_TEMPERATURE = _env("GEMINI_TEMPERATURE", default="0")
 GEMINI_SEED = _i("GEMINI_SEED", 7)
 # Gemini 2.5 Flash "thinking" tokens add seconds per call; extraction/verification here do not need them. -1 = model default.
 GEMINI_THINKING_BUDGET = _i("GEMINI_THINKING_BUDGET", 0)
+# Gemini 3.x models take a thinking LEVEL instead (minimal | low | medium | high; 3.8 Flash does not accept "minimal").
+# "low" is a good setting for extraction/verification. Empty = model default. Rejected values are auto-disabled with a warning.
+GEMINI_THINKING_LEVEL = _env("GEMINI_THINKING_LEVEL", default="")
 # Requests per minute allowed to Gemini generation (0 = no client-side limit). Set this to your plan's RPM
 # (free tier is roughly 10) so we pace calls instead of hitting 429 and sleeping 30+ seconds per retry.
 GEMINI_RPM = _i("GEMINI_RPM", 0)
@@ -75,7 +78,7 @@ MAX_PAIRS = _i("MAX_PAIRS", 300)
 
 # ---- Balance: surface criticism, null results and conflicts, not only agreement ----
 # Bump when retrieval/extraction/matching logic changes so old, agreement-biased investigations are not cloned or reused.
-PIPELINE_VERSION = _env("PIPELINE_VERSION", default="2026-11-balanced-v1")
+PIPELINE_VERSION = _env("PIPELINE_VERSION", default="2026-11-balanced-v2")
 CRITICAL_QUERIES = _i("CRITICAL_QUERIES", 3)                 # critical-angle search queries (null results, criticism, harms, failed replications)
 CRITICAL_SHARE = _f("CRITICAL_SHARE", 0.30)                  # share of candidate / kept-paper slots reserved for papers those queries found
 SCHOLAR_CRITICAL_QUERIES = _i("SCHOLAR_CRITICAL_QUERIES", 1) # how many critical queries also go to Google Scholar (5 s each)
@@ -87,7 +90,7 @@ IO_WORKERS = _i("IO_CONCURRENCY", 6)          # parallel full-text / API fetches
 # Reuse work done in earlier workspaces: paper embeddings, extracted claims, and verdicts for identical quote pairs.
 # Set REUSE_CACHE=false after changing GEMINI_EMBED_MODEL, the extraction prompt, or the verification rules.
 REUSE_CACHE = _b("REUSE_CACHE", True)
-MAX_TEXT_CHARS = _i("MAX_TEXT_CHARS", 40000)   # characters of a paper sent to the extractor (result-heavy passages are kept first)
+MAX_TEXT_CHARS = _i("MAX_TEXT_CHARS", 30000)   # characters of a paper sent to the extractor (result-heavy passages are kept first)
 # Whole-investigation reuse: a finished workspace for the same (or a near-identical) question is cloned instead of re-run.
 CACHE_DAYS = _i("CACHE_DAYS", 30)
 SEMANTIC_CACHE_THRESHOLD = _f("SEMANTIC_CACHE_THRESHOLD", 0.97)
@@ -126,3 +129,5 @@ def config_problems():
     if RUN_INLINE is False and REDIS_URL.startswith("redis://localhost") and os.getenv("RENDER"):
         out.append("RUN_INLINE is false but REDIS_URL is not configured; jobs cannot run. Set RUN_INLINE=true on Render free tier.")
     return out
+# Optional: protects /diagnostics/scholar (it spends Bright Data requests). If set, pass ?token=<value>.
+ADMIN_TOKEN = _env("ADMIN_TOKEN")

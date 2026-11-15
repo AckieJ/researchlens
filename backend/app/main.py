@@ -173,6 +173,46 @@ def diagnostics(refresh: bool = False):
     return out
 
 
+_scholar_diag = {"t": 0.0}
+
+
+@app.get("/diagnostics/scholar")
+def diagnostics_scholar(query: str = "virtual reality education", zone: str = "", raw: bool = False, token: str = ""):
+    """Fetch ONE Google Scholar results page through Bright Data and report what came back: what kind of page it was,
+    how many results parsed, and a text excerpt. Use it to debug the Scholar lane, or to compare zones:
+      /diagnostics/scholar?zone=<zone name>      (e.g. a SERP API zone instead of the Web Unlocker zone)
+      /diagnostics/scholar?raw=true              (adds the first 3,000 characters of the HTML)
+    Spends one Bright Data request; limited to one call per 20 s. If ADMIN_TOKEN is set, pass ?token=<ADMIN_TOKEN>."""
+    import re as _re
+    from urllib.parse import quote_plus
+    from .clients import brightdata as bd
+    from .clients.scholar_parse import BASE, describe, fingerprint, parse_scholar_html
+    if C.ADMIN_TOKEN and token != C.ADMIN_TOKEN:
+        raise HTTPException(403, "Pass ?token=<ADMIN_TOKEN>.")
+    if not (C.BRIGHT_DATA_API_KEY and (zone or C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE)):
+        raise HTTPException(400, "Bright Data is not configured (BRIGHT_DATA_API_KEY and a zone).")
+    if zone and not _re.fullmatch(r"[A-Za-z0-9_-]{1,64}", zone):
+        raise HTTPException(400, "Zone names contain only letters, digits, _ and -.")
+    if time.time() - _scholar_diag["t"] < 20:
+        raise HTTPException(429, "Wait 20 seconds between Scholar diagnostics.")
+    _scholar_diag["t"] = time.time()
+    use_zone = zone or C.BRIGHT_DATA_SCHOLAR_ZONE or C.BRIGHT_DATA_UNLOCKER_ZONE
+    url = f"{BASE}scholar?q={quote_plus(query[:200])}&hl=en&gl=us&as_sdt=0,5&as_vis=1&num=10"
+    bd.reset_fatal()
+    t0 = time.time()
+    try:
+        html = bd._unlock(url, use_zone).text
+    except Exception as e:
+        return {"ok": False, "zone": use_zone, "error": f"{type(e).__name__}: {str(e)[:400]}"}
+    items = parse_scholar_html(html)
+    fp = fingerprint(html)
+    out = {"ok": bool(items), "zone": use_zone, "seconds": round(time.time() - t0, 1), "parsed_results": len(items),
+           "summary": describe(fp), "fingerprint": fp, "first_titles": [i["title"] for i in items[:3]]}
+    if raw:
+        out["html_head"] = html[:3000]
+    return out
+
+
 @app.post("/workspaces/{ws}/retry")
 def retry_workspace(ws: str):
     """Resume a failed/interrupted investigation. Completed stages are reused where the pipeline is idempotent."""
