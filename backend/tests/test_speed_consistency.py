@@ -60,3 +60,12 @@ def test_identical_prompt_is_served_from_cache_without_calling_the_model(monkeyp
     first = gemini.generate_json("same prompt", system="s")
     second = gemini.generate_json("same prompt", system="s")
     assert first == second == {"ok": 1} and len(calls) == 1
+
+
+def test_bare_list_replies_are_accepted_or_rejected_never_crash():
+    import pytest
+    assert gemini._as_object([{"claims": [1]}]) == {"claims": [1]}
+    assert gemini._as_object([{"a": 1}, {"b": 2}], "claims") == {"claims": [{"a": 1}, {"b": 2}]}
+    assert gemini._as_object([], "claims") == {"claims": []}
+    with pytest.raises(ValueError):
+        gemini._as_object([], None)

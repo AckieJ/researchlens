@@ -72,6 +72,16 @@ MAX_CANDIDATES = _i("MAX_CANDIDATES", 150)
 MATCH_THRESHOLD = _f("MATCH_THRESHOLD", 0.80)
 STRONG_MATCH = _f("STRONG_MATCH", 0.88)   # similarity that overrides an outcome-family mismatch
 MAX_PAIRS = _i("MAX_PAIRS", 300)
+
+# ---- Balance: surface criticism, null results and conflicts, not only agreement ----
+# Bump when retrieval/extraction/matching logic changes so old, agreement-biased investigations are not cloned or reused.
+PIPELINE_VERSION = _env("PIPELINE_VERSION", default="2026-11-balanced-v1")
+CRITICAL_QUERIES = _i("CRITICAL_QUERIES", 3)                 # critical-angle search queries (null results, criticism, harms, failed replications)
+CRITICAL_SHARE = _f("CRITICAL_SHARE", 0.30)                  # share of candidate / kept-paper slots reserved for papers those queries found
+SCHOLAR_CRITICAL_QUERIES = _i("SCHOLAR_CRITICAL_QUERIES", 1) # how many critical queries also go to Google Scholar (5 s each)
+CONTRA_MATCH_THRESHOLD = _f("CONTRA_MATCH_THRESHOLD", 0.68)  # claim pairs that report opposite direction / significance are checked from this similarity
+CONTRA_STRONG_MATCH = _f("CONTRA_STRONG_MATCH", 0.76)        # ...and may skip the outcome-family match from this similarity
+CONTRA_PAIR_SHARE = _f("CONTRA_PAIR_SHARE", 0.50)            # share of MAX_PAIRS verified slots reserved for such opposing pairs
 WORKERS = _i("LLM_CONCURRENCY", 4)
 IO_WORKERS = _i("IO_CONCURRENCY", 6)          # parallel full-text / API fetches (not LLM calls)
 # Reuse work done in earlier workspaces: paper embeddings, extracted claims, and verdicts for identical quote pairs.

@@ -30,6 +30,19 @@ def parse_json(text):
     return json.loads(t[a:b + 1] if a >= 0 and b > a else t)
 
 
+def _as_object(data, list_key=None):
+    """Models occasionally answer with a bare list or a one-element list instead of the requested object.
+    Accept those shapes; anything else raises, so retry() asks again and the bad reply is never cached."""
+    if isinstance(data, list):
+        if len(data) == 1 and isinstance(data[0], dict):
+            data = data[0]
+        elif list_key:
+            data = {list_key: data}
+    if not isinstance(data, dict):
+        raise ValueError(f"Gemini returned {type(data).__name__} instead of a JSON object")
+    return data
+
+
 _gate_lock = threading.Lock()
 _next_slot = [0.0]
 
@@ -79,7 +92,7 @@ def _cache_put(key, value):
         log.warning("llm_cache write failed", exc_info=True)
 
 
-def generate_json(prompt, system=None, model=None, cache=True):
+def generate_json(prompt, system=None, model=None, cache=True, list_key=None):
     """JSON generation. Deterministic settings, and identical (model, settings, system, prompt) input is answered from the
     database: the same question always sees the same interpretation, claims and verdicts, and costs no API call."""
     from google.genai import types
@@ -100,7 +113,7 @@ def generate_json(prompt, system=None, model=None, cache=True):
         r = client().models.generate_content(
             model=model, contents=prompt,
             config=types.GenerateContentConfig(system_instruction=system, response_mime_type="application/json", **cfg))
-        return parse_json(r.text)
+        return _as_object(parse_json(r.text), list_key)
 
     out = retry(call, tries=5)
     if key:

@@ -67,3 +67,11 @@ export const LABELS = {
   related_not_comparable: { name: 'Related, not comparable', color: 'var(--muted)', dash: [2, 5] },
   unresolved: { name: 'Unresolved', color: 'var(--amber)', dash: [3, 4] },
 }
+
+// Gaps are drawn on the map as markers in the wedge of the sub-question they belong to.
+export const GAPS = {
+  missing: { name: 'Gap: little or no evidence found', color: 'var(--amber)' },
+  one_sided: { name: 'One-sided: only agreeing evidence found', color: 'var(--amber)' },
+}
+// Everything that is NOT plain agreement. Used by the "tensions only" view and the balance panel.
+export const TENSION_TYPES = ['genuine_contradiction', 'apparent_contradiction', 'unresolved']

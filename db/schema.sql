@@ -120,3 +120,7 @@ CREATE INDEX IF NOT EXISTS papers_key_idx ON papers ((coalesce(doi, lower(title)
 CREATE INDEX IF NOT EXISTS edges_claim_b_idx ON claim_edges(claim_b);
 CREATE INDEX IF NOT EXISTS papers_ws_kept_idx ON papers(workspace_id) WHERE kept;
 CREATE INDEX IF NOT EXISTS claims_quote_idx ON claims (md5(quote));
+
+-- ---- Balance additions (idempotent) ----
+-- Structured data for gap flags (type: missing | one_sided, sub-question index, number of papers) so gaps can be drawn on the map.
+ALTER TABLE flags ADD COLUMN IF NOT EXISTS meta jsonb;

@@ -8,6 +8,8 @@ Stack: React + Cytoscape (frontend) · FastAPI + RQ workers (backend) · Tiger D
 
 **November 2026 update:** OpenAlex uses `OPENALEX_API_KEY` (`Authorization: Bearer`). See [DEPLOY_RENDER_VERCEL.md](DEPLOY_RENDER_VERCEL.md) for the live-only UI, queue requirements, and Render + Vercel setup.
 
+**v7 (balance):** the map now surfaces conflicts, one-sided evidence and gaps, not just agreement. See [CHANGES_BALANCE.md](CHANGES_BALANCE.md); re-run your question after deploying.
+
 > **This version has no fictional demo data or demo route.** The live dashboard displays only real backend results; a missing worker or failed API displays a clear error.
 
 > **Status:** the backend logic that needs no external services is unit-tested (`backend/tests`). The full pipeline and Google Scholar parser have **not** been tested with your live provider credentials. The frontend dependency installation could not complete in the build environment; check the Vercel build logs. Follow "First run checklist" below and expect to adjust small details.

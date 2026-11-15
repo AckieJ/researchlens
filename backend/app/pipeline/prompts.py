@@ -31,14 +31,19 @@ def understand(question):
         "Return JSON with keys: population (string), intervention (string), outcome (string), comparison (string), "
         "outcome_families (list of 2-5 short strings, e.g. 'test scores', 'retention'), "
         "search_queries (3-5 scholarly search queries), "
-        "sub_questions (3-6 distinct sub-questions that together cover the question)."
+        "sub_questions (3-6 distinct sub-questions that together cover the question), "
+        "critical_queries (3-4 scholarly search queries written to find evidence that CHALLENGES the premise of the question: "
+        "null or negative results, failed replications, adverse effects, criticisms, limitations, boundary conditions, conflicting findings; "
+        "use the topic's own keywords plus words such as 'no effect', 'failed to replicate', 'limitations', 'criticism', 'adverse', 'harm')."
     )
 
 
 def extract(p, text, level):
     meta = f"Title: {p['title']}\nYear: {p['year']}\nText level: {level} ({'full text' if level == 'full' else 'abstract only'})"
     return (
-        meta + "\n\nExtract 3 to 6 distinct, testable findings (results, not background). Return JSON: "
+        meta + "\n\nExtract 3 to 6 distinct, testable findings (results, not background). Do not pick only the headline positive result: "
+        "include null, negative, mixed or unexpected findings, results that cut against the authors' own hypothesis, and findings the "
+        "authors say did not hold in a subgroup or condition. Report direction and significance exactly as the paper states them. Return JSON: "
         '{"claims":[{"claim_text":"one normalized sentence","intervention":"","outcome":"","outcome_family":"",'
         '"direction":"increase|decrease|no_effect|mixed","significance":"significant|not_significant|not_reported",'
         '"effect_size":"as reported or not_reported","population":"","sample_n":integer or null,"design":"",'

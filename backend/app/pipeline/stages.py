@@ -14,6 +14,7 @@ from ..clients import brightdata as bd
 from ..clients.brightdata import ScholarBlocked, ScholarClient, UnlockerClient
 from ..db import ex, exmany, one, pool, q, vec
 from . import prompts
+from .balance import clean_queries, fallback_critical_queries, has_dissent, reserve_quota
 from .dedupe import dedupe
 from .layout import assign_angles, child_angles, evidence_strength, minmax, relevance
 from .text import comparability, find_doi, focus_text, guess_title, jaccard, locate, normalize, passage, pdf_to_text, quote_ok
@@ -111,8 +112,8 @@ def _clone_sql():
         "INSERT INTO paper_scores (workspace_id,paper_id,relevance,sector,angle,parent_paper) "
          "SELECT %(dst)s::uuid,pm.n,s.relevance,s.sector,s.angle,(SELECT x.n FROM pm x WHERE x.o=s.parent_paper) "
          "FROM paper_scores s JOIN pm ON pm.o=s.paper_id WHERE s.workspace_id=%(src)s::uuid",
-        "INSERT INTO flags (workspace_id,kind,description,claim_ids) "
-         "SELECT %(dst)s::uuid,f.kind,f.description,ARRAY(SELECT cm.n FROM cm WHERE cm.o = ANY(f.claim_ids)) FROM flags f WHERE f.workspace_id=%(src)s::uuid",
+        "INSERT INTO flags (workspace_id,kind,description,claim_ids,meta) "
+         "SELECT %(dst)s::uuid,f.kind,f.description,ARRAY(SELECT cm.n FROM cm WHERE cm.o = ANY(f.claim_ids)),f.meta FROM flags f WHERE f.workspace_id=%(src)s::uuid",
     ]
 
 
@@ -137,14 +138,16 @@ def find_cached_workspace(ws):
         "WHERE m.id=%s AND s.id <> m.id AND s.status='done' AND s.created_at > now() - make_interval(days => %s) "
         "AND EXISTS (SELECT 1 FROM papers p WHERE p.workspace_id=s.id AND p.kept) "
         "AND NOT EXISTS (SELECT 1 FROM papers p WHERE p.workspace_id=s.id AND (p.is_upload OR p.is_new)) "
+        "AND s.progress->>'pipeline_version' = %s "                 # never clone an investigation made by older (agreement-biased) logic
         "AND (s.question_key = m.question_key OR 1-(s.embedding <=> m.embedding) >= %s) "
         "ORDER BY (s.question_key = m.question_key) DESC, sim DESC, s.created_at DESC LIMIT 1",
-        (ws, C.CACHE_DAYS, C.SEMANTIC_CACHE_THRESHOLD))
+        (ws, C.CACHE_DAYS, C.PIPELINE_VERSION, C.SEMANTIC_CACHE_THRESHOLD))
 
 
 def understand(ws):
     """Interpret the question. Returns the parsed dict, or None when a finished identical investigation was reused."""
     w = one("SELECT question, progress FROM workspaces WHERE id=%s", (ws,))
+    progress(ws, pipeline_version=C.PIPELINE_VERSION)
     try:
         emb = gemini.embed([w["question"]])[0]
         ex("UPDATE workspaces SET embedding=%s::vector WHERE id=%s", (vec(emb), ws))
@@ -171,6 +174,9 @@ def understand(ws):
             seen.add(s_.strip().lower())
             qs.append(s_.strip())
     parsed["search_queries"] = qs[:5] or [w["question"]]
+    # Critical-angle queries: without them every search is phrased like the question and only agreeable papers come back.
+    crit = [c for c in clean_queries(parsed.get("critical_queries"), C.CRITICAL_QUERIES) if c.lower() not in seen]
+    parsed["critical_queries"] = crit or fallback_critical_queries(parsed["search_queries"], C.CRITICAL_QUERIES)
     parsed["sub_questions"] = [s for s in parsed.get("sub_questions") or [] if s][:6] or [w["question"]]
     parsed["outcome_families"] = [s for s in parsed.get("outcome_families") or [] if s][:5]
     ex("UPDATE workspaces SET parsed=%s::jsonb WHERE id=%s", (json.dumps(parsed), ws))
@@ -206,6 +212,8 @@ def discover(ws, parsed):
         if qs.strip().lower() not in seen:
             seen.add(qs.strip().lower())
             queries.append(qs)
+    critical = [c for c in (parsed.get("critical_queries") or []) if c.strip().lower() not in seen]
+    crit_set = {c.strip().lower() for c in critical}
 
     def oa_search(qs):
         try:
@@ -216,7 +224,7 @@ def discover(ws, parsed):
     def scholar_lane():
         """Runs in parallel with the OpenAlex lane. Pages are rate limited, but DOI resolution is fanned out."""
         found, warns = [], []
-        for qs in queries[:C.SCHOLAR_QUERIES]:
+        for qs in queries[:C.SCHOLAR_QUERIES] + critical[:C.SCHOLAR_CRITICAL_QUERIES]:
             try:
                 items = scholar.search(qs, 20)
             except ScholarBlocked as e:
@@ -234,7 +242,7 @@ def discover(ws, parsed):
     with ThreadPoolExecutor(1) as side:
         fut = side.submit(scholar_lane) if use_scholar else None
         cands = []
-        for found, warn in pmap(oa_search, queries, C.IO_WORKERS):      # API lane: all queries at once
+        for found, warn in pmap(oa_search, queries + critical, C.IO_WORKERS):      # API lane: all queries (normal + critical) at once
             cands.extend(found)
             if warn:
                 warnings.append(warn)
@@ -247,10 +255,14 @@ def discover(ws, parsed):
     new, dups, extra = dedupe([c for c in cands if c.get("title")], existing)
     if not new and not existing:
         raise RuntimeError("No papers were found. " + (" | ".join(warnings[:3]) or "The search APIs returned nothing for this question; try rephrasing it."))
-    pmap(lambda c: insert_paper(ws, c), new[:C.MAX_CANDIDATES], C.IO_WORKERS)
+    # The candidate cap used to cut from the END of the list, which is exactly where the critical queries' results sat.
+    is_crit = lambda c: any((qq or "").strip().lower() in crit_set for _, qq in c.get("sources") or [])
+    chosen = reserve_quota(new, is_crit, C.MAX_CANDIDATES, C.CRITICAL_SHARE)
+    pmap(lambda c: insert_paper(ws, c), chosen, C.IO_WORKERS)
     for pid, lane, query in extra:
         add_source(pid, lane, query)
-    progress(ws, duplicates_removed=dups, candidates=min(len(new), C.MAX_CANDIDATES) + len(existing), warnings=warnings)
+    progress(ws, duplicates_removed=dups, candidates=len(chosen) + len(existing), warnings=warnings,
+             critical_candidates=sum(1 for c in chosen if is_crit(c)))
 
 
 def reuse_paper_embeddings(ws):
@@ -278,13 +290,22 @@ def embed_papers(ws):
     _set_embeddings("papers", rows, embs)
 
 
-def prelim_rank(ws, cap):
-    """Keep uploads plus the papers most similar to the question; returns the ranked kept ids."""
+def prelim_rank(ws, cap, critical_queries=()):
+    """Keep uploads plus the papers most similar to the question; returns the ranked kept ids.
+    A share of the slots (CRITICAL_SHARE) is reserved for papers found by the critical-angle queries: similarity to the
+    question alone would rank every paper that challenges its premise below the ones that agree with it."""
     rows = q("SELECT p.id, p.is_upload, 1-(p.embedding <=> w.embedding) AS sim FROM papers p "
              "JOIN workspaces w ON w.id=p.workspace_id WHERE p.workspace_id=%s AND p.embedding IS NOT NULL "
              "ORDER BY p.is_upload DESC, round((1-(p.embedding <=> w.embedding))::numeric, 5) DESC, coalesce(p.doi, lower(p.title))", (ws,))
     cap = max(cap, sum(1 for r in rows if r["is_upload"]))
-    keep = [r["id"] for r in rows][:cap]
+    crit_q = [c.strip().lower() for c in critical_queries or []]
+    crit = {r["paper_id"] for r in q("SELECT DISTINCT s.paper_id FROM paper_sources s JOIN papers p ON p.id=s.paper_id "
+                                      "WHERE p.workspace_id=%s AND lower(trim(s.query)) = ANY(%s::text[])", (ws, crit_q))} if crit_q else set()
+    uploads = [r["id"] for r in rows if r["is_upload"]]
+    rest = [r for r in rows if not r["is_upload"]]
+    keep = uploads + [r["id"] for r in reserve_quota(rest, lambda r: r["id"] in crit, max(0, cap - len(uploads)), C.CRITICAL_SHARE)]
+    order = {r["id"]: i for i, r in enumerate(rows)}
+    keep.sort(key=lambda k: order[k])                                                  # keep the similarity order
     ex("UPDATE papers SET kept = (id = ANY(%s::uuid[])) WHERE workspace_id=%s", ([str(k) for k in keep], ws))
     return keep
 
@@ -391,11 +412,12 @@ def reuse_claims(p):
     Quotes stay valid because the source text is identical (same text level, near-identical length)."""
     if not C.REUSE_CACHE:
         return 0
-    src = one("SELECT p2.id FROM papers p2 WHERE p2.workspace_id <> %s::uuid AND p2.text_level = %s "
+    src = one("SELECT p2.id FROM papers p2 JOIN workspaces w2 ON w2.id = p2.workspace_id "
+              "WHERE w2.progress->>'pipeline_version' = %s AND p2.workspace_id <> %s::uuid AND p2.text_level = %s "
               "AND coalesce(p2.doi, lower(p2.title)) = coalesce(%s, lower(%s)) "
               "AND abs(coalesce(length(p2.full_text),0) - %s) < 50 "
               "AND EXISTS (SELECT 1 FROM claims c WHERE c.paper_id = p2.id) ORDER BY p2.created_at DESC LIMIT 1",
-              (p["workspace_id"], p.get("text_level") or "abstract", p.get("doi"), p.get("title") or "",
+              (C.PIPELINE_VERSION, p["workspace_id"], p.get("text_level") or "abstract", p.get("doi"), p.get("title") or "",
                len(p.get("full_text") or "")))
     if not src:
         return 0
@@ -415,8 +437,10 @@ def extract_paper(p):
     nt, level = normalize(full), p.get("text_level") or "abstract"   # what a quote must match: the whole paper
     prompt, valid, rejected, seen = prompts.extract(p, text, level), [], 0, set()
     for attempt in range(2):
-        data = gemini.generate_json(prompt, system=prompts.EXTRACT_SYSTEM)
+        data = gemini.generate_json(prompt, system=prompts.EXTRACT_SYSTEM, list_key="claims")
         for c in data.get("claims") or []:
+            if not isinstance(c, dict):                      # skip malformed entries instead of crashing the whole paper
+                continue
             qt = c.get("quote") or ""
             if qt in seen:
                 continue
@@ -471,23 +495,37 @@ def extract_all(ws):
 
 
 # ---------- Stage 6: match claims before comparing ----------
-MATCH_SQL = """
-SELECT a.id AS a_id, b.id AS b_id, 1-(a.embedding <=> b.embedding) AS sim
+# Pairs are normally ranked by embedding similarity, and the most similar pairs are near-paraphrases, i.e. agreement.
+# With a small MAX_PAIRS the verifier would only ever see agreement. So a reserved share of the verification budget goes
+# to "tension" pairs: same topic, but one claim reports a different direction (or significance) than the other.
+TENSION = ("((a.direction IN ('increase','decrease','no_effect') AND b.direction IN ('increase','decrease','no_effect') "
+           "AND a.direction <> b.direction) OR (a.significance IN ('significant','not_significant') "
+           "AND b.significance IN ('significant','not_significant') AND a.significance <> b.significance))")
+_SIM = "1-(a.embedding <=> b.embedding)"
+_MATCH_BASE = """
+SELECT a.id AS a_id, b.id AS b_id, """ + _SIM + """ AS sim, """ + TENSION + """ AS tension
 FROM claims a JOIN claims b ON a.id < b.id AND a.paper_id <> b.paper_id
 JOIN papers pa ON pa.id=a.paper_id JOIN papers pb ON pb.id=b.paper_id
 WHERE pa.workspace_id=%(ws)s AND pb.workspace_id=%(ws)s AND pa.kept AND pb.kept
   AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
   AND (%(only)s::uuid[] IS NULL OR a.paper_id = ANY(%(only)s::uuid[]) OR b.paper_id = ANY(%(only)s::uuid[]))
-  AND 1-(a.embedding <=> b.embedding) >= %(th)s
-  AND (lower(coalesce(a.outcome_family,'')) = lower(coalesce(b.outcome_family,'')) OR 1-(a.embedding <=> b.embedding) >= %(strong)s)
   AND NOT EXISTS (SELECT 1 FROM claim_edges e WHERE (e.claim_a=a.id AND e.claim_b=b.id) OR (e.claim_a=b.id AND e.claim_b=a.id))
-ORDER BY round((1-(a.embedding <=> b.embedding))::numeric, 5) DESC, least(a.quote, b.quote), greatest(a.quote, b.quote) LIMIT %(lim)s
+  AND {cond}
+ORDER BY round((""" + _SIM + """)::numeric, 5) DESC, least(a.quote, b.quote), greatest(a.quote, b.quote) LIMIT %(lim)s
 """
+MATCH_SQL = _MATCH_BASE.replace("{cond}", _SIM + " >= %(th)s AND (lower(coalesce(a.outcome_family,'')) = lower(coalesce(b.outcome_family,'')) OR " + _SIM + " >= %(strong)s)")
+TENSION_SQL = _MATCH_BASE.replace("{cond}", TENSION + " AND " + _SIM + " >= %(cth)s AND (lower(coalesce(a.outcome_family,'')) = lower(coalesce(b.outcome_family,'')) OR " + _SIM + " >= %(cstrong)s)")
 
 
 def match(ws, only=None):
-    return q(MATCH_SQL, {"ws": ws, "only": [str(x) for x in only] if only else None, "th": C.MATCH_THRESHOLD,
-                         "strong": C.STRONG_MATCH, "lim": C.MAX_PAIRS})
+    base = {"ws": ws, "only": [str(x) for x in only] if only else None}
+    budget = max(1, C.MAX_PAIRS)
+    tension = q(TENSION_SQL, {**base, "cth": C.CONTRA_MATCH_THRESHOLD, "cstrong": C.CONTRA_STRONG_MATCH,
+                              "lim": max(1, int(budget * C.CONTRA_PAIR_SHARE))})
+    taken = {(str(r["a_id"]), str(r["b_id"])) for r in tension}
+    rest = [r for r in q(MATCH_SQL, {**base, "th": C.MATCH_THRESHOLD, "strong": C.STRONG_MATCH, "lim": budget})
+            if (str(r["a_id"]), str(r["b_id"])) not in taken][: max(0, budget - len(tension))]
+    return [dict(r, tension=True) for r in tension] + [dict(r, tension=bool(r.get("tension"))) for r in rest]
 
 
 # ---------- Stage 7: verify relationships ----------
@@ -581,16 +619,28 @@ def build_flags(ws):
     for r in q("SELECT id,title,retraction_status FROM papers WHERE workspace_id=%s AND kept AND retraction_status<>'none'", (ws,)):
         ex("INSERT INTO flags (workspace_id,kind,description) VALUES (%s,'retraction',%s)",
            (ws, f"{r['title']} has a {r['retraction_status']} notice. Treat its claims with caution."))
-    # (3) topics unrepresented in THIS library (never a claim about all research)
+    # (3) topics unrepresented in THIS library (never a claim about all research), and topics where only agreement surfaced
     w = one("SELECT parsed FROM workspaces WHERE id=%s", (ws,))
     subs = (w["parsed"] or {}).get("sub_questions") or []
     if subs:
-        for sq, e in zip(subs, gemini.embed(subs)):
-            r = one("SELECT count(DISTINCT c.paper_id) AS n FROM claims c JOIN papers p ON p.id=c.paper_id "
-                    "WHERE c.workspace_id=%s AND p.kept AND c.embedding IS NOT NULL AND 1-(c.embedding <=> %s::vector) >= 0.68", (ws, vec(e)))
-            if r["n"] < 2:
-                ex("INSERT INTO flags (workspace_id,kind,description) VALUES (%s,'library_gap',%s)",
-                   (ws, f"Not found in the papers examined: {sq} ({r['n']} paper(s) clearly address it)."))
+        for idx, (sq, e) in enumerate(zip(subs, gemini.embed(subs))):
+            rows = q("SELECT c.id, c.paper_id, c.direction, c.significance FROM claims c JOIN papers p ON p.id=c.paper_id "
+                     "WHERE c.workspace_id=%s AND p.kept AND c.embedding IS NOT NULL AND 1-(c.embedding <=> %s::vector) >= 0.68 "
+                     "ORDER BY c.id", (ws, vec(e)))
+            n = len({str(r["paper_id"]) for r in rows})
+            if n < 2:
+                ex("INSERT INTO flags (workspace_id,kind,description,claim_ids,meta) VALUES (%s,'library_gap',%s,%s::uuid[],%s::jsonb)",
+                   (ws, f"Not found in the papers examined: {sq} ({n} paper(s) clearly address it).", [str(r["id"]) for r in rows[:3]],
+                    json.dumps({"type": "missing", "sector": idx, "sub_question": sq, "n_papers": n})))
+                continue
+            ids = [str(r["id"]) for r in rows]
+            conflict = one("SELECT 1 AS x FROM claim_edges e WHERE e.workspace_id=%s AND e.label IN ('genuine_contradiction','apparent_contradiction') "
+                           "AND (e.claim_a = ANY(%s::uuid[]) OR e.claim_b = ANY(%s::uuid[])) LIMIT 1", (ws, ids, ids))
+            if not has_dissent(rows, bool(conflict)):
+                ex("INSERT INTO flags (workspace_id,kind,description,claim_ids,meta) VALUES (%s,'one_sided',%s,%s::uuid[],%s::jsonb)",
+                   (ws, f"Only agreeing evidence surfaced for: {sq} ({n} papers; no null, mixed or opposing result among their claims). "
+                        "This can mean real agreement, or that critical studies were not retrieved.", ids[:3],
+                    json.dumps({"type": "one_sided", "sector": idx, "sub_question": sq, "n_papers": n})))
 
 
 def external_check(ws):
@@ -691,6 +741,15 @@ class Timer:
             self.name = None
 
 
+def _count_critical_kept(ws, crit_queries):
+    """How many retained papers were found by a critical-angle query (shown on the map's balance panel)."""
+    crit = [c.strip().lower() for c in crit_queries or []]
+    if not crit:
+        return 0
+    return one("SELECT count(DISTINCT p.id) AS n FROM papers p JOIN paper_sources s ON s.paper_id=p.id "
+               "WHERE p.workspace_id=%s AND p.kept AND lower(trim(s.query)) = ANY(%s::text[])", (ws, crit))["n"]
+
+
 def _bd_progress(ws, before):
     now = bd.snapshot()
     progress(ws, bright_data={k: now[k] - before.get(k, 0) for k in now})
@@ -711,19 +770,22 @@ def run_workspace(ws):
         _bd_progress(ws, bd0)
         tm.to("embed_rank", "retrieving")
         embed_papers(ws)
-        keep = prelim_rank(ws, C.MAX_PAPERS)
+        crit_q = parsed.get("critical_queries") or []
+        keep = prelim_rank(ws, C.MAX_PAPERS, crit_q)
         tm.to("expand")
         expand(ws, keep)
         embed_papers(ws)
-        prelim_rank(ws, C.MAX_PAPERS)
+        prelim_rank(ws, C.MAX_PAPERS, crit_q)
+        progress(ws, critical_queries=crit_q)
         tm.to("retrieve_text")
         retrieve_all(ws)
         _bd_progress(ws, bd0)
+        progress(ws, critical_kept=_count_critical_kept(ws, crit_q))
         tm.to("extract_claims", "extracting")
         extract_all(ws)
         tm.to("match", "matching")
         pairs = match(ws)
-        progress(ws, candidate_pairs=len(pairs))
+        progress(ws, candidate_pairs=len(pairs), tension_pairs=sum(1 for p_ in pairs if p_.get("tension")))
         tm.to("verify", "verifying")
         verify_pairs(ws, pairs)
         external_check(ws)

@@ -9,7 +9,7 @@ function List({ title, note, items }) {
       {items.length === 0 && <p className="muted">Nothing flagged.</p>}
       {items.map((f) => (
         <article key={f.id} className="claim">
-          <p>{f.description}</p>
+          <p>{f.kind === 'one_sided' && <span className="badge warn">one-sided</span>}{f.description}</p>
           {f.evidence.map((x, i) => <blockquote key={i}>{x.quote}<footer className="small muted">{x.paper}{x.location ? `, ${x.location}` : ''}</footer></blockquote>)}
         </article>
       ))}
@@ -27,7 +27,7 @@ export default function Gaps({ id }) {
     <div className="three">
       <List title="Stated limitations" note="Limits the authors themselves reported." items={d.limitations} />
       <List title="Weakly supported claims" note="Abstract-only, small samples, or retraction notices, with no compatible support elsewhere in this library." items={d.weak_claims} />
-      <List title="Not found in this library" note="Topics the papers examined do not clearly address. This is about the current collection only, not all of science." items={d.library_gaps} />
+      <List title="Not found in this library" note="Topics the papers examined do not clearly address, or address with only agreeing evidence (one-sided). This is about the current collection only, not all of science." items={d.library_gaps} />
     </div>
   )
 }

@@ -6,6 +6,8 @@ import Compare from './Compare.jsx'
 import Gaps from './Gaps.jsx'
 import Chat from './Chat.jsx'
 import AddPaper from './AddPaper.jsx'
+import Balance from './Balance.jsx'
+import GapDetail from './GapDetail.jsx'
 
 const NAV = [
   ['graph', '◎', 'Evidence map'],
@@ -46,6 +48,8 @@ export default function Workspace({ id, status, onHome }) {
   useEffect(() => { if (inspectorScroll.current) inspectorScroll.current.scrollTop = 0 }, [selection?.id, selection?.type])
   const chooseEdge = (edgeId) => {setSelection({type:'edge',id:edgeId});setCompareId(edgeId)}
   const choosePaper = paperId => setSelection({type:'paper',id:paperId})
+  const chooseGap = gapId => setSelection({type:'gap',id:gapId})
+  const gaps = graph?.gaps || []
 
   return <div className="app-shell dashboard-shell live-dashboard">
     <header className="dashboard-header">
@@ -65,21 +69,23 @@ export default function Workspace({ id, status, onHome }) {
       <main className="dashboard-main">
         <div className="workspace-header"><div className="eyebrow muted-eyebrow">CURRENT INVESTIGATION <span className="crumb-slash">/</span> LIVE EVIDENCE</div><h1>{status.question}</h1><p>Explore real scholarly sources, claim relationships, methodological differences, and unresolved questions.</p><div className="workspace-labels"><span>◉ Live workspace</span><span>◷ {c.full_text || 0} full-text studies</span><span>⊙ {c.abstract_only || 0} abstracts</span></div></div>
         <div className="metric-row">
-          {[["◈",papers.length,'Papers analyzed'],['⌘',c.claims || 0,'Extracted claims'],['⇄',relationships,'Claim relationships'],['◇',contradictionCount,'Potential conflicts']].map(([icon,value,label])=><div className="metric-card" key={label}><span className="metric-icon">{icon}</span><div><strong>{value}</strong><small>{label}</small></div></div>)}
+          {[["◈",papers.length,'Papers analyzed'],['⌘',c.claims || 0,'Extracted claims'],['⇄',relationships,'Claim relationships'],['◇',contradictionCount,'Potential conflicts'],['△',gaps.length,'Gaps on the map']].map(([icon,value,label])=><div className="metric-card" key={label}><span className="metric-icon">{icon}</span><div><strong>{value}</strong><small>{label}</small></div></div>)}
         </div>
         {evaluating&&<div className="live-banner">A newly uploaded paper is being evaluated. This view will update when processing finishes.</div>}
         {error&&<div className="live-banner error" role="alert">Unable to load the evidence graph: {error} <button onClick={()=>setRevision(r=>r+1)}>Retry</button></div>}
 
+        {tab==='graph'&&<Balance graph={graph}/>}
         {tab==='graph'&&<div className="dashboard-content">
           <section className="graph-workspace" aria-label="Evidence network">
-            <div className="panel-heading"><div><h2>Evidence network</h2><p>Select a paper or connection to inspect real source evidence.</p></div><button className="help-trigger" onClick={()=>setHelp(v=>!v)} aria-expanded={help}>ⓘ How to read this</button></div>
+            <div className="panel-heading"><div><h2>Evidence network</h2><p>Select a paper, connection or gap marker to inspect the evidence, including where it disagrees or is missing.</p></div><button className="help-trigger" onClick={()=>setHelp(v=>!v)} aria-expanded={help}>ⓘ How to read this</button></div>
             {help&&<div className="help-note">Use the mouse wheel or +/− controls to zoom as you would on a map. Paper titles appear as you zoom closer; drag the canvas to move around. Click a colored line to inspect its evidence. Distance from the center indicates relevance, not scientific truth. Inspect source quotations before drawing conclusions.</div>}
-            {graph ? (papers.length ? <GraphView graph={graph} selected={selection} onPaper={choosePaper} onEdge={chooseEdge}/> : <div className="live-empty"><div className="empty-symbol">◇</div><h3>No papers in this evidence graph</h3><p>The investigation completed without retained papers. Try a narrower question, check retrieval access, or add a PDF.</p><button className="primary" onClick={()=>setTab('add')}>Upload a paper ↗</button></div>) : <div className="live-empty"><div className="spinner"/><h3>Loading your evidence network…</h3></div>}
+            {graph ? (papers.length ? <GraphView graph={graph} selected={selection} onPaper={choosePaper} onEdge={chooseEdge} onGap={chooseGap}/> : <div className="live-empty"><div className="empty-symbol">◇</div><h3>No papers in this evidence graph</h3><p>The investigation completed without retained papers. Try a narrower question, check retrieval access, or add a PDF.</p><button className="primary" onClick={()=>setTab('add')}>Upload a paper ↗</button></div>) : <div className="live-empty"><div className="spinner"/><h3>Loading your evidence network…</h3></div>}
           </section>
-          <aside className="inspector-panel"><div className="panel-heading"><div><h2>Evidence inspector</h2><p>{selection ? selection.type === 'paper' ? 'Selected scientific paper' : 'Selected relationship' : 'Select a paper or connection'}</p></div><span className="inspector-symbol">✧</span></div>
+          <aside className="inspector-panel"><div className="panel-heading"><div><h2>Evidence inspector</h2><p>{selection ? selection.type === 'paper' ? 'Selected scientific paper' : selection.type === 'gap' ? 'Selected gap' : 'Selected relationship' : 'Select a paper, connection or gap'}</p></div><span className="inspector-symbol">✧</span></div>
             <div className="inspector-body" ref={inspectorScroll} tabIndex={0} aria-label="Scrollable paper and comparison details">
               {!selection&&<div className="inspector-empty"><div className="empty-symbol">◎</div><h3>Explore the evidence</h3><p>Click a paper to read its extracted claims and source quotations. Click a relationship to compare the study methods and findings.</p><p className="inspector-notice">Every item in this workspace comes from your live backend, not example data.</p></div>}
               {selection?.type==='paper'&&<PaperPanel id={selection.id} onEdge={chooseEdge}/>}
+              {selection?.type==='gap'&&<GapDetail gap={gaps.find(g=>g.id===selection.id)} onOpenGaps={()=>setTab('gaps')}/>}
               {selection?.type==='edge'&&<><Compare id={selection.id} onPaper={choosePaper}/><button className="primary full-button" onClick={()=>setTab('compare')}>Open full comparison ↗</button></>}
             </div>
           </aside>

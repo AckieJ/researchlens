@@ -1,5 +1,6 @@
 """Read models for the API: graph, edge detail, paper detail, flags, status."""
 from ..db import one, q
+from .balance import gap_angle, gap_sector, paper_conflict_level, short, summarize_edges
 from .layout import radius
 
 PRIORITY = ["genuine_contradiction", "apparent_contradiction", "unresolved", "supports_compatible", "related_not_comparable"]
@@ -21,7 +22,7 @@ def status(ws):
 
 
 def graph(ws):
-    w = one("SELECT question, parsed FROM workspaces WHERE id=%s", (ws,))
+    w = one("SELECT question, parsed, progress FROM workspaces WHERE id=%s", (ws,))
     papers = q("SELECT p.id, p.title, p.year, p.doi, p.url, p.text_level, p.retraction_status, p.is_new, p.is_upload, p.lane, "
                "p.confidence, s.relevance, s.sector, s.angle, s.parent_paper, "
                "(SELECT count(*) FROM claims c WHERE c.paper_id=p.id) AS n_claims "
@@ -30,6 +31,17 @@ def graph(ws):
         p["radius"] = radius(p["relevance"])
     rows = q("SELECT e.id, e.label, e.confidence, ca.paper_id AS pa, cb.paper_id AS pb FROM claim_edges e "
              "JOIN claims ca ON ca.id=e.claim_a JOIN claims cb ON cb.id=e.claim_b WHERE e.workspace_id=%s", (ws,))
+    # Per-paper criticism markers, so the map shows WHERE the disagreement and the weak spots are, not only the agreement.
+    claim_counts, touched = summarize_edges(rows)
+    flagged = {}
+    for r in q("SELECT c.paper_id, f.kind, count(DISTINCT f.id) AS n FROM flags f JOIN claims c ON c.id = ANY(f.claim_ids) "
+               "WHERE f.workspace_id=%s AND f.kind IN ('limitation','weak_claim') GROUP BY 1, 2", (ws,)):
+        flagged.setdefault(str(r["paper_id"]), {})[r["kind"]] = r["n"]
+    for p in papers:
+        t, f = touched.get(str(p["id"]), {}), flagged.get(str(p["id"]), {})
+        p["conflict_level"] = paper_conflict_level(t)
+        p["conflicts"] = {"genuine": t.get("genuine_contradiction", 0), "apparent": t.get("apparent_contradiction", 0), "unresolved": t.get("unresolved", 0)}
+        p["n_limitations"], p["n_weak"] = f.get("limitation", 0), f.get("weak_claim", 0)
     agg = {}
     for r in rows:
         key = tuple(sorted((str(r["pa"]), str(r["pb"]))))
@@ -44,8 +56,37 @@ def graph(ws):
         edges.append({"source": a["source"], "target": a["target"], "label": label, "counts": a["counts"],
                       "top_edge_id": a["top"][label][0]})
     parsed = w["parsed"] or {}
-    return {"question": w["question"], "sub_questions": parsed.get("sub_questions") or [], "rings": [0.8, 0.6, 0.4, 0.2],
-            "papers": papers, "edges": edges}
+    subs = parsed.get("sub_questions") or []
+    gaps = _map_gaps(ws, subs)
+    prog = w["progress"] or {}
+    paper_links = {}
+    for e in edges:
+        paper_links[e["label"]] = paper_links.get(e["label"], 0) + 1
+    balance = {"claim_edges": claim_counts, "paper_links": paper_links,
+               "papers_in_conflict": sum(1 for p in papers if p["conflict_level"] in ("genuine", "apparent")),
+               "gaps": {"missing": sum(1 for g in gaps if g["type"] == "missing"), "one_sided": sum(1 for g in gaps if g["type"] == "one_sided")},
+               "search": {"critical_queries": prog.get("critical_queries") or parsed.get("critical_queries") or [],
+                          "critical_kept": prog.get("critical_kept"), "tension_pairs": prog.get("tension_pairs"),
+                          "candidate_pairs": prog.get("candidate_pairs"), "pipeline_version": prog.get("pipeline_version")}}
+    return {"question": w["question"], "sub_questions": subs, "rings": [0.8, 0.6, 0.4, 0.2],
+            "papers": papers, "edges": edges, "gaps": gaps, "balance": balance}
+
+
+def _map_gaps(ws, subs):
+    """Gap flags positioned in the wedge of the sub-question they belong to, so they can be drawn on the map."""
+    out = []
+    for r in q("SELECT id, kind, description, meta FROM flags WHERE workspace_id=%s AND kind IN ('library_gap','one_sided') ORDER BY kind, id", (ws,)):
+        meta = r["meta"] or {}
+        sector = meta.get("sector")
+        if sector is None:
+            sector = gap_sector(r["description"], subs)            # workspaces created before gap metadata existed
+        if sector is None or not subs:
+            continue
+        sq = meta.get("sub_question") or (subs[sector] if sector < len(subs) else "")
+        out.append({"id": str(r["id"]), "kind": r["kind"], "type": meta.get("type") or ("one_sided" if r["kind"] == "one_sided" else "missing"),
+                    "sector": sector, "angle": gap_angle(sector, len(subs)), "sub_question": sq, "label": short(sq, 60),
+                    "n_papers": meta.get("n_papers"), "description": r["description"]})
+    return out
 
 
 def _claim_view(c):
@@ -86,7 +127,7 @@ def paper_detail(pid):
 
 
 def flags(ws):
-    rows = q("SELECT id, kind, description, claim_ids FROM flags WHERE workspace_id=%s ORDER BY kind", (ws,))
+    rows = q("SELECT id, kind, description, claim_ids, meta FROM flags WHERE workspace_id=%s ORDER BY kind", (ws,))
     for r in rows:
         ids = [str(i) for i in (r["claim_ids"] or [])][:3]
         r["evidence"] = [{"paper": x["title"], "quote": x["quote"], "location": x["location"], "paper_id": x["paper_id"]} for x in
@@ -94,4 +135,4 @@ def flags(ws):
         r.pop("claim_ids", None)
     return {"limitations": [r for r in rows if r["kind"] == "limitation"],
             "weak_claims": [r for r in rows if r["kind"] in ("weak_claim", "retraction")],
-            "library_gaps": [r for r in rows if r["kind"] == "library_gap"]}
+            "library_gaps": [r for r in rows if r["kind"] in ("library_gap", "one_sided")]}
