@@ -234,3 +234,4 @@ html{scroll-behavior:smooth}body{font-family:var(--sans);background:var(--bg);co
 .lg-gap{width:11px;height:11px;display:inline-block;background:#fff6e3;border:2px dashed #c98a22;transform:rotate(45deg)}
 .lg-gap.one{background:#f3f1fc;border:2px solid #8b7fc4;transform:none;border-radius:3px}
 .gap-detail h3{margin:10px 0 4px}
+.fresh-toggle.disabled{opacity:.55;cursor:not-allowed}

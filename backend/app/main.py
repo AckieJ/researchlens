@@ -232,13 +232,15 @@ def list_workspaces():
 
 
 @app.post("/workspaces")
-async def create_workspace(question: str = Form(...), fresh: bool = Form(False), files: list[UploadFile] = File(default=[])):
+async def create_workspace(question: str = Form(...), fresh: bool = Form(False), web_search: bool = Form(True), files: list[UploadFile] = File(default=[])):
     question = question.strip()
     if len(question) < 8:
         raise HTTPException(400, "Enter a research question of at least a few words.")
+    if not web_search and len(files) < 2:
+        raise HTTPException(400, "Skipping the web search needs at least 2 uploaded PDFs (there is nothing to compare otherwise).")
     blobs = [(f.filename, await _read_pdf(f)) for f in files]
     ws = one("INSERT INTO workspaces (question, question_key, progress) VALUES (%s,%s,%s::jsonb) RETURNING id",
-             (question, question_key(question), json.dumps({"fresh": bool(fresh)})))["id"]
+             (question, question_key(question), json.dumps({"fresh": bool(fresh), "web_search": bool(web_search)})))["id"]
     for name, data in blobs:
         stages.ingest_upload(ws, name, data)
     try:

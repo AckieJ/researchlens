@@ -371,13 +371,23 @@ def retrieve_full_text(p):
     return (p.get("abstract") or ""), "abstract", "abstract"
 
 
-def retrieve_all(ws):
+def uploads_only(ws):
+    """True when the user chose 'use only my uploaded papers' (no web search, no external text fetching)."""
+    w = one("SELECT progress FROM workspaces WHERE id=%s", (ws,))
+    return (w and (w["progress"] or {}).get("web_search")) is False
+
+
+def retrieve_all(ws, offline=False):
     rows = q("SELECT * FROM papers WHERE workspace_id=%s AND kept ORDER BY id", (ws,))
     tally = {"uploaded": 0, "europepmc": 0, "brightdata": 0, "abstract": 0}
 
     def work(p):
         try:
-            text, level, src = retrieve_full_text(p)
+            if offline:      # uploads-only: use exactly the text already extracted from the PDF; no network
+                t = p.get("full_text") or p.get("abstract") or ""
+                text, level, src = t, ("full" if len(t) >= C.FULL_TEXT_MIN else "abstract"), ("uploaded" if t else "abstract")
+            else:
+                text, level, src = retrieve_full_text(p)
         except Exception:
             text, level, src = (p.get("full_text") or p.get("abstract") or ""), "abstract", "abstract"
         tally[src] += 1
@@ -386,6 +396,11 @@ def retrieve_all(ws):
     pmap(work, rows, C.IO_WORKERS)
     progress(ws, text_sources=tally)
     ex("UPDATE papers SET kept=false WHERE workspace_id=%s AND kept AND coalesce(length(full_text),0) < 200", (ws,))
+    if offline:
+        lost = one("SELECT count(*) AS n FROM papers WHERE workspace_id=%s AND is_upload AND NOT kept", (ws,))["n"]
+        if lost:
+            _warn(ws, f"{lost} uploaded PDF(s) had almost no extractable text (scanned images?) and were left out. "
+                      "Use text-based PDFs, or run OCR first.")
     # Scholar-only results that never resolved to a DOI stay out of verdicts unless full text was retrieved.
     ex("UPDATE papers SET kept=false WHERE workspace_id=%s AND kept AND confidence='low' AND text_level<>'full'", (ws,))
 
@@ -765,22 +780,32 @@ def run_workspace(ws):
             tm.close()
             set_status(ws, "done")
             return
-        tm.to("discover", "discovering")
-        discover(ws, parsed)
-        _bd_progress(ws, bd0)
-        tm.to("embed_rank", "retrieving")
-        embed_papers(ws)
-        crit_q = parsed.get("critical_queries") or []
-        keep = prelim_rank(ws, C.MAX_PAPERS, crit_q)
-        tm.to("expand")
-        expand(ws, keep)
-        embed_papers(ws)
-        prelim_rank(ws, C.MAX_PAPERS, crit_q)
-        progress(ws, critical_queries=crit_q)
-        tm.to("retrieve_text")
-        retrieve_all(ws)
-        _bd_progress(ws, bd0)
-        progress(ws, critical_kept=_count_critical_kept(ws, crit_q))
+        offline = uploads_only(ws)
+        if offline:
+            # Uploads-only: no web discovery, no citation expansion, no external full-text fetching.
+            tm.to("embed_rank", "retrieving")
+            embed_papers(ws)
+            crit_q = []
+            prelim_rank(ws, C.MAX_PAPERS)
+            tm.to("retrieve_text")
+            retrieve_all(ws, offline=True)
+        else:
+            tm.to("discover", "discovering")
+            discover(ws, parsed)
+            _bd_progress(ws, bd0)
+            tm.to("embed_rank", "retrieving")
+            embed_papers(ws)
+            crit_q = parsed.get("critical_queries") or []
+            keep = prelim_rank(ws, C.MAX_PAPERS, crit_q)
+            tm.to("expand")
+            expand(ws, keep)
+            embed_papers(ws)
+            prelim_rank(ws, C.MAX_PAPERS, crit_q)
+            progress(ws, critical_queries=crit_q)
+            tm.to("retrieve_text")
+            retrieve_all(ws)
+            _bd_progress(ws, bd0)
+            progress(ws, critical_kept=_count_critical_kept(ws, crit_q))
         tm.to("extract_claims", "extracting")
         extract_all(ws)
         tm.to("match", "matching")
