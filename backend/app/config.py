@@ -17,10 +17,14 @@ EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
 
 BRIGHT_DATA_API_KEY = os.getenv("BRIGHT_DATA_API_KEY", "")
 BRIGHT_DATA_UNLOCKER_ZONE = os.getenv("BRIGHT_DATA_UNLOCKER_ZONE", "")
-BRIGHT_DATA_SCHOLAR_ID = os.getenv("BRIGHT_DATA_SCHOLAR_ID", "")
-BRIGHT_DATA_SCHOLAR_INPUT_MODE = os.getenv("BRIGHT_DATA_SCHOLAR_INPUT_MODE", "url")
+# Zone used for Google Scholar pages (defaults to the Web Unlocker zone above)
+BRIGHT_DATA_SCHOLAR_ZONE = os.getenv("BRIGHT_DATA_SCHOLAR_ZONE", "")
+SCHOLAR_MIN_INTERVAL = float(os.getenv("SCHOLAR_MIN_INTERVAL", "5"))   # seconds between Scholar requests
+SCHOLAR_MAX_REQUESTS = int(os.getenv("SCHOLAR_MAX_REQUESTS", "20"))     # per client instance (per pipeline stage)
 
-OPENALEX_EMAIL = os.getenv("OPENALEX_EMAIL", "")
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "").strip()
+# Optional contact email for User-Agent; no longer an authentication mechanism.
+OPENALEX_EMAIL = os.getenv("OPENALEX_EMAIL", "").strip()
 
 MAX_PAPERS = int(os.getenv("MAX_PAPERS", "30"))
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "150"))

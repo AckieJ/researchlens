@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .. import config as C
 from ..clients import gemini, scholarly as oa
 from ..clients.allowlist import allowed
-from ..clients.brightdata import ScholarClient, UnlockerClient
+from ..clients.brightdata import ScholarBlocked, ScholarClient, UnlockerClient
 from ..db import ex, one, q, vec
 from . import prompts
 from .dedupe import dedupe
@@ -97,16 +97,18 @@ def resolve_scholar_item(it, lane="B", query=None):
     links = {"cited_by": it.get("cited_by_url"), "related": it.get("related_url")}
     w = None
     try:
-        w = oa.work_by_title(it["title"], it.get("year"))
+        doi = find_doi(it.get("url") or "") or find_doi(it.get("pdf_url") or "")
+        w = (oa.work_by_doi(doi) if doi else None) or oa.work_by_title(it["title"], it.get("year"))
     except Exception:
         pass
     if w:
         w.update({"lane": lane, "query": query, "scholar_links": links})
         w["url"] = w.get("url") or it.get("url")
+        w["oa_url"] = w.get("oa_url") or it.get("pdf_url")
         return w
-    return {"title": it["title"], "year": it.get("year"), "authors": it.get("authors"), "url": it.get("url"),
-            "abstract": it.get("snippet"), "confidence": "low", "lane": lane, "query": query,
-            "cited_by_count": it.get("cited_by_count", 0), "scholar_links": links}
+    return {"title": it["title"], "year": it.get("year"), "authors": it.get("authors"), "venue": it.get("venue"),
+            "url": it.get("url"), "oa_url": it.get("pdf_url"), "abstract": it.get("snippet"), "confidence": "low",
+            "lane": lane, "query": query, "cited_by_count": it.get("cited_by_count", 0), "scholar_links": links}
 
 
 def discover(ws, parsed):
@@ -120,14 +122,16 @@ def discover(ws, parsed):
                 cands.append(w)
         except Exception as e:
             warnings.append(f"OpenAlex failed for '{qs[:40]}': {e}")
-        if scholar.enabled():
+        if scholar.enabled() and not scholar.blocked:
             try:
                 for it in scholar.search(qs, 20):
                     cands.append(resolve_scholar_item(it, "B", qs))
+            except ScholarBlocked as e:
+                warnings.append(f"Google Scholar lane stopped: {e}")
             except Exception as e:
-                warnings.append(f"Google Scholar scraper failed for '{qs[:40]}': {e}")
+                warnings.append(f"Google Scholar fetch failed for '{qs[:40]}': {e}")
     if not scholar.enabled():
-        warnings.append("Google Scholar lane skipped: BRIGHT_DATA_SCHOLAR_ID / API key not set.")
+        warnings.append("Google Scholar lane skipped: BRIGHT_DATA_API_KEY or Web Unlocker zone not set.")
     new, dups, extra = dedupe([c for c in cands if c.get("title")], existing)
     for c in new[:C.MAX_CANDIDATES]:
         insert_paper(ws, c)
@@ -161,7 +165,7 @@ def expand(ws, keep, seeds=5):
     for s in seed_rows:
         links = s.get("scholar_links") or {}
         try:
-            if scholar.enabled() and any(links.values()):
+            if scholar.enabled() and not scholar.blocked and any(links.values()):
                 for kind, url in links.items():
                     if url:
                         for it in scholar.expand(url, 10):

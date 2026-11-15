@@ -2,15 +2,17 @@
 
 A claim-level evidence graph for one research question. It gathers papers, extracts testable claims with **verbatim quotes**, compares only claims that address the same hypothesis, and shows where findings agree, genuinely conflict, only *appear* to conflict, or remain unresolved. The graph is radial: the question sits in the center and **distance from the center = relevance** (a navigation aid, not a truth score).
 
-Stack: React + Cytoscape (frontend) · FastAPI + RQ workers (backend) · Tiger Data (Postgres + pgvector) · Gemini · Bright Data · Vultr.
+Stack: React + Cytoscape (frontend) · FastAPI + RQ workers (backend) · Tiger Data (Postgres + pgvector) · Gemini · Bright Data · OpenAlex · deploy on Render/Vercel or Vultr.
 
-> **Status:** the backend logic that needs no external services is unit-tested (`backend/tests`). The full pipeline, the Bright Data Scholar request format, and the frontend build were **not run against live services** when this repo was generated. Follow "First run checklist" below and expect to adjust small details.
+**November 2026 update:** OpenAlex uses `OPENALEX_API_KEY` (`Authorization: Bearer`). See [OPENALEX_AND_DEPLOYMENT.md](OPENALEX_AND_DEPLOYMENT.md) for the exact setup and the updated professional UI / GitHub Pages preview.
+
+> **Status:** the backend logic that needs no external services is unit-tested (`backend/tests`). The full pipeline, the Google Scholar HTML parser against a real page, and the frontend build were **not run against live services** when this repo was generated. Follow "First run checklist" below and expect to adjust small details.
 
 ## How it works
 
 ```
 Browser (React + Cytoscape) -> FastAPI -> Redis/RQ worker -> OpenAlex / Crossref / Europe PMC (APIs)
-                                   |                      -> Bright Data Google Scholar scraper (more sources)
+                                   |                      -> Bright Data Web Unlocker -> Google Scholar pages (more sources)
                                    |                      -> Bright Data Web Unlocker (allowlisted public pages)
                                    |                      -> Gemini (extract, verify, embed, chat)
                                    v
@@ -21,7 +23,7 @@ Browser (React + Cytoscape) -> FastAPI -> Redis/RQ worker -> OpenAlex / Crossref
 |---|---|---|
 | 0 | `pipeline/stages.ingest_upload` | Parse uploaded PDFs, find DOI, add to library |
 | 1 | `stages.understand` | Gemini turns the question into queries, outcome families, sub-questions |
-| 2 | `stages.discover` | Lane A (OpenAlex) + Lane B (Google Scholar via Bright Data), resolve to DOIs, de-duplicate |
+| 2 | `stages.discover` | Lane A (OpenAlex) + Lane B (Google Scholar pages fetched via Bright Data Web Unlocker, parsed in-house), resolve to DOIs, de-duplicate |
 | 3 | `embed_papers`, `prelim_rank`, `expand`, `retrieve_all` | Rank, citation expansion (second ring), full text via Europe PMC then Web Unlocker, else abstract-only |
 | 4 | `extract_all` | Gemini claims; **code rejects any claim whose quote is not found in the source text** |
 | 6 | `match` | SQL + pgvector candidate pairs with a comparability checklist |
@@ -35,13 +37,13 @@ Relevance = 0.45 cosine(claims, question) + 0.20 outcome match + 0.20 citation c
 
 ## First run checklist
 
-1. **Accounts and keys:** Gemini API key; Tiger Data service (Postgres with pgvector); Bright Data API key.
+1. **Accounts and keys:** Gemini API key; Tiger Data service (Postgres with pgvector); Bright Data API key; **OpenAlex free API key** (set `OPENALEX_API_KEY`).
 2. `cp .env.example .env` and fill it in (see below).
-3. **Bright Data setup**
-   - Create a **Web Unlocker zone** and put its name in `BRIGHT_DATA_UNLOCKER_ZONE`.
-   - In **Scraper APIs**, open the **Google Scholar scraper**, run one query in the playground, and note: the input field it expects (`url` or `keyword`), the output field names, and the dataset/scraper ID. Put the ID in `BRIGHT_DATA_SCHOLAR_ID` and set `BRIGHT_DATA_SCHOLAR_INPUT_MODE`.
-   - **Verify and adjust** `ScholarClient` in `backend/app/clients/brightdata.py` (endpoint `datasets/v3/scrape`, async polling, and the field mapping in `_norm`) to match what the playground shows. The Web Unlocker call (`POST https://api.brightdata.com/request`) should work as written; confirm against the current docs.
-   - If Scholar is not configured the pipeline still runs on OpenAlex and logs a warning on the progress screen.
+3. **Bright Data setup** (one product: Web Unlocker)
+   - Create a **Web Unlocker zone** and put its name in `BRIGHT_DATA_UNLOCKER_ZONE`. Optionally create a second zone just for Google Scholar and set `BRIGHT_DATA_SCHOLAR_ZONE` (blank = reuse the first).
+   - There is **no prebuilt Scholar scraper to configure**. `ScholarClient` (`backend/app/clients/brightdata.py`) fetches Scholar result pages through the Web Unlocker (`POST https://api.brightdata.com/request`) and `backend/app/clients/scholar_parse.py` turns the HTML into results (title, authors, year, snippet, link, PDF link, cited-by and related-article links).
+   - **Test the parser on a real page first:** run one search, save the HTML, and compare it with the fixture in `backend/tests/test_scholar_parse.py`. If Google's markup differs, fix the selectors in `scholar_parse.py` (they live in that one file) and update the fixture.
+   - Scholar is throttled (`SCHOLAR_MIN_INTERVAL`, default 5 s), capped (`SCHOLAR_MAX_REQUESTS`, default 20 per pipeline stage), cached for 7 days, and the client **stops for the rest of the run if Google serves a CAPTCHA** (the progress screen shows a warning). If Scholar is not configured or blocked, the pipeline continues on OpenAlex.
 4. **Database:** `DATABASE_URL` from Tiger Data. The schema is applied automatically on API start (`python -m app.init_db`). `vector(768)` in `db/schema.sql` must match `EMBED_DIM`.
 5. **Run it** (Docker): `docker compose up --build`, then open http://localhost. Without Docker, see "Local development".
 6. **Smoke test:** ask a question, watch the progress screen: lane counts, full text vs abstract-only, claims extracted, **quotes rejected** (should be small). Open a red or dashed-red line and confirm both quotations appear in the source.
@@ -71,7 +73,7 @@ Tests (no keys or database needed): `cd backend && pytest` (or run the functions
 
 ## Rules for public pages (enforced in code where possible)
 
-- Only publicly accessible pages; no login, payment or access-control circumvention. `UnlockerClient` refuses any URL not in `backend/config/allowlist.yaml` (or `EXTRA_ALLOWED_DOMAINS`). Google Scholar is reached only via the Scholar scraper, never the Unlocker.
+- Only publicly accessible pages; no login, payment or access-control circumvention. `UnlockerClient` refuses any URL not in `backend/config/allowlist.yaml` (or `EXTRA_ALLOWED_DOMAINS`). Google Scholar is the one exception: `ScholarClient` may fetch only `scholar.google.com`, with its own stricter limits.
 - Check each site's robots.txt and terms before adding a domain. Using Bright Data does not remove that responsibility from the team.
 - Requests are limited to one per second per domain, retried with backoff, and cached for 7 days (`fetch_cache`).
 - Stored: metadata, extracted claims, and short quotations with a link and DOI. Uploaded PDFs belong to the workspace; do not expose them publicly.
@@ -104,7 +106,7 @@ Pick a demo topic with documented disagreement and read the key papers yourself.
 
 ## Known limits
 
-- Scholar scraper field mapping and the model names in `.env` (`GEMINI_MODEL`, etc.) may need adjusting to what your accounts offer.
+- The Scholar HTML selectors (Google can change its markup at any time, and Scholar's terms restrict automated access, so keep volumes small) and the model names in `.env` (`GEMINI_MODEL`, etc.) may need adjusting to what your accounts offer.
 - Library gaps always mean "not found in the papers examined", never "unstudied".
 - A non-significant result never refutes a significant one; the prompts and the self-check pass enforce this, but review verdicts by hand before presenting them.
 - No authentication: workspaces are reachable by id. Add auth before exposing the app publicly with private uploads.

@@ -6,16 +6,22 @@ from ..pipeline.text import norm_doi, title_sim, xml_to_text
 from .util import retry
 
 OA = "https://api.openalex.org"
-UA = {"User-Agent": f"ResearchLens/0.1 (mailto:{C.OPENALEX_EMAIL or 'unknown@example.com'})"}
+# OpenAlex now accepts a free API key using Authorization: Bearer or ?api_key=...
+# Keep credentials out of URLs, logs, and browser-side code by using the header.
+UA = {"User-Agent": "ResearchLens/0.2" + (f" (mailto:{C.OPENALEX_EMAIL})" if C.OPENALEX_EMAIL else "")}
 
 
 def _get(url, params=None, timeout=40):
     params = dict(params or {})
-    if C.OPENALEX_EMAIL and "openalex" in url:
-        params["mailto"] = C.OPENALEX_EMAIL
+    headers = dict(UA)
+    # Authentication is ONLY sent to the genuine OpenAlex API host.
+    # Other services (Crossref and Europe PMC) must never receive the API key.
+    from urllib.parse import urlparse
+    if urlparse(url).hostname == "api.openalex.org" and C.OPENALEX_API_KEY:
+        headers["Authorization"] = f"Bearer {C.OPENALEX_API_KEY}"
 
     def call():
-        r = requests.get(url, params=params, headers=UA, timeout=timeout)
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 404:
             return None
         r.raise_for_status()
